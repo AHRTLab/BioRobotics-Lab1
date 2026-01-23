@@ -64,13 +64,13 @@ Lab_1/
 ├── src/
 │   ├── lsl_utils.py        # LSL utilities (stream discovery, recording)
 │   ├── visualizer.py       # Real-time EMG visualizer
-│   ├── myo_interface.py    # Myo Armband interface
+│   ├── myo_interface.py    # Myo Armband interface (uses pyomyo)
 │   ├── emg_processing.py   # Signal processing functions
 │   └── proportional_control.py  # Control demo
 ├── notebooks/
 │   └── Lab1_EMG_Analysis.ipynb  # Main analysis notebook
 ├── data/
-│   └── sample_emg.csv      # Sample data for testing
+│   └── (your recorded data)
 └── docs/
     └── Lab1_Manual.pdf     # Lab manual (PDF)
 ```
@@ -107,14 +107,33 @@ LSL is a protocol for streaming time-series data over a network. Key concepts:
 
 ### Myo Armband
 
-1. Install MyoConnect (Windows only)
-2. Plug in the Bluetooth dongle
-3. Put on the armband (LED facing wrist)
-4. Perform sync gesture (wave out)
-5. Run the Myo streamer:
+The Myo interface uses **pyomyo**, which communicates directly via Bluetooth - no SDK or MyoConnect needed!
+
+**Installation:**
+```bash
+pip install git+https://github.com/PerlinWarp/pyomyo.git
+```
+
+**IMPORTANT: Close MyoConnect before running!** pyomyo and MyoConnect cannot both access the Myo at the same time.
+
+**Hardware Setup:**
+1. Charge the Myo armband
+2. Put on the armband (LED facing wrist)
+3. Close MyoConnect if it's running
+4. Run the streamer:
    ```bash
    python src/myo_interface.py
    ```
+
+**EMG Modes:**
+- `--mode raw` (default): 200Hz, unfiltered (-128 to 127)
+- `--mode filtered`: 200Hz, filtered but not rectified
+- `--mode preprocessed`: 50Hz, bandpass filtered + rectified
+
+**Testing without hardware:**
+```bash
+python src/myo_interface.py --mock
+```
 
 ### BioRadio 150
 
@@ -190,8 +209,15 @@ python src/proportional_control.py --mock  # Test without hardware
 ### No Streams Found
 
 - Ensure device is powered on and connected
-- Check that device software (MyoConnect, BioCapture) is running
+- Check that device software (BioCapture for BioRadio) is running
 - Try increasing the timeout: `discover_streams(timeout=5.0)`
+
+### Myo Connection Issues
+
+- **Close MyoConnect first!** pyomyo and MyoConnect cannot both access the Myo
+- Make sure the Myo is charged and powered on
+- The Myo should vibrate when pyomyo connects
+- Try: `python src/myo_interface.py --mock` to test without hardware
 
 ### Poor Signal Quality
 

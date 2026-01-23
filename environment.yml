@@ -47,8 +47,9 @@ dependencies:
   
   # Pip-only packages
   - pip:
-    # Myo armband support (community maintained)
-    - myo-python>=1.0.5
+    # Myo armband support - pyomyo communicates directly via Bluetooth (no SDK needed)
+    # IMPORTANT: Close MyoConnect before using!
+    - git+https://github.com/PerlinWarp/pyomyo.git
     
     # Signal processing
     - neurokit2>=0.2  # Biosignal processing toolkit
