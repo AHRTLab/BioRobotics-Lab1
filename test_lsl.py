@@ -43,7 +43,11 @@ def discover_streams():
     print("\n=== Discovering Streams ===")
     print("Scanning for 3 seconds...")
     
-    streams = pylsl.resolve_streams(timeout=3.0)
+    # Note: parameter name varies by pylsl version (timeout vs wait_time)
+    try:
+        streams = pylsl.resolve_streams(wait_time=3.0)
+    except TypeError:
+        streams = pylsl.resolve_streams(3.0)  # Positional fallback
     
     if streams:
         print(f"\nFound {len(streams)} stream(s):")
@@ -82,7 +86,11 @@ def receive_data(stream_name, duration=3):
     """Try to receive data from a stream."""
     print(f"\n=== Receiving from '{stream_name}' ===")
     
-    streams = pylsl.resolve_byprop("name", stream_name, timeout=2.0)
+    try:
+        streams = pylsl.resolve_byprop("name", stream_name, timeout=2.0)
+    except TypeError:
+        streams = pylsl.resolve_byprop("name", stream_name, 1, 2.0)  # Positional fallback
+    
     if not streams:
         print(f"Stream '{stream_name}' not found!")
         return

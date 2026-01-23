@@ -122,7 +122,10 @@ class LSLStreamReader(threading.Thread):
         try:
             # Find and connect to stream
             print(f"Looking for stream: {self.stream_name}")
-            streams = pylsl.resolve_byprop("name", self.stream_name, timeout=5.0)
+            try:
+                streams = pylsl.resolve_byprop("name", self.stream_name, timeout=5.0)
+            except TypeError:
+                streams = pylsl.resolve_byprop("name", self.stream_name, 1, 5.0)
             
             if not streams:
                 self.error = f"Stream '{self.stream_name}' not found"
@@ -271,7 +274,11 @@ if HAS_GUI and HAS_LSL:
             QApplication.processEvents()
             
             try:
-                streams = pylsl.resolve_streams(timeout=2.0)
+                # Parameter name varies by pylsl version
+                try:
+                    streams = pylsl.resolve_streams(wait_time=2.0)
+                except TypeError:
+                    streams = pylsl.resolve_streams(2.0)
                 
                 for stream in streams:
                     name = stream.name()
@@ -307,7 +314,10 @@ if HAS_GUI and HAS_LSL:
             stream_name = self.stream_combo.currentData()
             
             # Get stream info
-            streams = pylsl.resolve_byprop("name", stream_name, timeout=2.0)
+            try:
+                streams = pylsl.resolve_byprop("name", stream_name, timeout=2.0)
+            except TypeError:
+                streams = pylsl.resolve_byprop("name", stream_name, 1, 2.0)
             if not streams:
                 QMessageBox.warning(self, "Error", f"Stream '{stream_name}' not found")
                 return
@@ -449,7 +459,17 @@ def main():
     parser = argparse.ArgumentParser(description="EMG Visualizer")
     parser.add_argument("--stream", help="Stream name to connect to")
     parser.add_argument("--dark", action="store_true", default=True, help="Dark mode")
+    parser.add_argument("--mock", action="store_true", help="Create internal mock stream for testing")
     args = parser.parse_args()
+    
+    # Start mock stream if requested
+    mock_thread = None
+    mock_outlet = None
+    if args.mock:
+        print("Starting internal mock EMG stream...")
+        mock_outlet, mock_thread = create_mock_stream()
+        time.sleep(0.5)  # Give stream time to register
+        args.stream = "MockEMG_EMG"  # Auto-connect to mock stream
     
     app = QApplication(sys.argv)
     
@@ -459,10 +479,70 @@ def main():
     
     # Auto-connect if stream specified
     if args.stream:
-        window.stream_combo.setCurrentText(args.stream)
+        # Refresh to find the stream first
+        window.refresh_streams()
+        # Find and select the stream
+        for i in range(window.stream_combo.count()):
+            if args.stream in window.stream_combo.itemText(i):
+                window.stream_combo.setCurrentIndex(i)
+                break
         window.connect_stream()
     
-    return app.exec()
+    result = app.exec()
+    
+    # Cleanup mock stream
+    if mock_thread:
+        mock_thread.do_run = False
+        mock_thread.join(timeout=1.0)
+    
+    return result
+
+
+def create_mock_stream():
+    """Create an internal mock EMG stream for testing."""
+    import threading
+    
+    # Create stream info
+    info = pylsl.StreamInfo(
+        name="MockEMG_EMG",
+        type="EMG",
+        channel_count=8,
+        nominal_srate=200,
+        channel_format=pylsl.cf_float32,
+        source_id="MockEMG_internal"
+    )
+    
+    outlet = pylsl.StreamOutlet(info)
+    print(f"Created mock stream: MockEMG_EMG (8ch, 200Hz)")
+    
+    def generate_data(outlet):
+        """Generate synthetic EMG data."""
+        t = 0
+        thread = threading.current_thread()
+        while getattr(thread, 'do_run', True):
+            # Generate 8 channels of synthetic EMG
+            sample = []
+            for ch in range(8):
+                # Base noise
+                val = np.random.normal(0, 5)
+                
+                # Add periodic bursts
+                if np.sin(2 * np.pi * 0.3 * t + ch * np.pi / 4) > 0.6:
+                    val += np.random.normal(50, 20)
+                
+                # Add 60Hz interference
+                val += 3 * np.sin(2 * np.pi * 60 * t)
+                sample.append(val)
+            
+            outlet.push_sample(sample)
+            t += 1/200
+            time.sleep(1/200)
+    
+    thread = threading.Thread(target=generate_data, args=(outlet,), daemon=True)
+    thread.do_run = True
+    thread.start()
+    
+    return outlet, thread
 
 
 if __name__ == "__main__":
