@@ -5,8 +5,9 @@ BioRobotics Lab 1 - Myo Armband Interface
 This module provides an LSL interface for the Myo Armband.
 The Myo streams 8 channels of sEMG at 200 Hz, plus IMU data.
 
-Note: The Myo Armband requires MyoConnect to be running on Windows.
-This module reads from the Myo SDK and publishes data to LSL.
+Note: The Myo Armband requires:
+1. MyoConnect to be running on Windows
+2. The Myo SDK (myo64.dll) to be in the sdk/myo-sdk-win-0.9.0/bin folder
 
 Channel Layout (EMG):
 - EMG_1 through EMG_8: 8 sEMG channels around the forearm
@@ -21,6 +22,7 @@ Updated: 2025
 """
 
 import sys
+import os
 import time
 import threading
 from dataclasses import dataclass, field
@@ -32,17 +34,96 @@ import numpy as np
 
 try:
     import pylsl
+
     HAS_LSL = True
 except ImportError:
     HAS_LSL = False
 
-# Try to import Myo SDK
-try:
-    # The myo-python package provides the Myo SDK bindings
-    import myo
-    HAS_MYO = True
-except ImportError:
-    HAS_MYO = False
+# Try to import and initialize Myo SDK
+HAS_MYO = False
+MYO_ERROR = None
+
+
+def _find_myo_sdk():
+    """Find the Myo SDK directory."""
+    # Possible locations for the SDK
+    script_dir = Path(__file__).parent.parent  # Lab root directory
+    possible_paths = [
+        script_dir / "sdk" / "myo-sdk-win-0.9.0" / "bin",
+        script_dir / "Myo" / "myo-sdk-win-0.9.0" / "bin",
+        script_dir / "myo" / "myo-sdk-win-0.9.0" / "bin",
+        Path("sdk") / "myo-sdk-win-0.9.0" / "bin",
+        Path("Myo") / "myo-sdk-win-0.9.0" / "bin",
+        Path("myo") / "myo-sdk-win-0.9.0" / "bin",
+    ]
+
+    for path in possible_paths:
+        if path.exists() and (path / "myo64.dll").exists():
+            return str(path)
+
+    return None
+
+
+def _init_myo():
+    """Initialize the Myo SDK."""
+    global HAS_MYO, MYO_ERROR
+
+    sdk_path = _find_myo_sdk()
+
+    if sdk_path is None:
+        MYO_ERROR = (
+            "Myo SDK not found. Please ensure the SDK is in one of these locations:\n"
+            "  - sdk/myo-sdk-win-0.9.0/bin/myo64.dll\n"
+            "  - Myo/myo-sdk-win-0.9.0/bin/myo64.dll\n"
+            "\n"
+            "Download the SDK from the course materials or GitHub repository."
+        )
+        return False
+
+    try:
+        # Add SDK path to system PATH for DLL loading
+        os.environ['PATH'] = sdk_path + os.pathsep + os.environ.get('PATH', '')
+
+        # Try the myo-python package first
+        try:
+            import myo as libmyo
+            libmyo.init(sdk_path=sdk_path)
+            HAS_MYO = True
+            print(f"Myo SDK initialized from: {sdk_path}")
+            return True
+        except (ImportError, TypeError):
+            pass
+
+        # Try alternative import pattern
+        try:
+            import myo_python.myo as libmyo
+            libmyo.init(sdk_path)
+            HAS_MYO = True
+            print(f"Myo SDK initialized from: {sdk_path}")
+            return True
+        except ImportError:
+            pass
+
+        MYO_ERROR = (
+            "myo-python package not installed correctly.\n"
+            "Install with: pip install myo-python"
+        )
+        return False
+
+    except Exception as e:
+        MYO_ERROR = f"Error initializing Myo SDK: {e}"
+        return False
+
+
+# Try to initialize on import
+_init_myo()
+
+# Import myo module if available
+if HAS_MYO:
+    try:
+        import myo as libmyo
+    except ImportError:
+        import myo_python.myo as libmyo
 
 
 @dataclass
@@ -55,7 +136,7 @@ class MyoData:
     gyroscope: dict = field(default_factory=lambda: {'x': 0, 'y': 0, 'z': 0})
     arm: str = "unknown"
     synced: bool = False
-    
+
     def to_emg_list(self) -> list:
         """Convert to list for LSL streaming."""
         return [
@@ -75,19 +156,19 @@ class MyoData:
 
 
 if HAS_MYO:
-    
-    class MyoLSLListener(myo.DeviceListener):
+
+    class MyoLSLListener(libmyo.DeviceListener):
         """
         Myo device listener that publishes data to LSL.
         """
-        
+
         def __init__(self, stream_name: str = "Myo"):
             super().__init__()
             self.stream_name = stream_name
             self.data = MyoData()
             self.sample_count = 0
             self._setup_lsl_outlets()
-        
+
         def _setup_lsl_outlets(self):
             """Create LSL outlets for EMG and IMU data."""
             # EMG outlet (8 channels at 200 Hz)
@@ -99,19 +180,19 @@ if HAS_MYO:
                 channel_format=pylsl.cf_int8,
                 source_id=f'{self.stream_name}_EMG'
             )
-            
+
             # Add channel descriptions
             desc = emg_info.desc()
             desc.append_child_value("manufacturer", "Thalmic Labs")
             channels = desc.append_child("channels")
             for i in range(8):
                 ch = channels.append_child("channel")
-                ch.append_child_value("label", f"EMG_{i+1}")
+                ch.append_child_value("label", f"EMG_{i + 1}")
                 ch.append_child_value("unit", "raw")
                 ch.append_child_value("type", "EMG")
-            
+
             self.emg_outlet = pylsl.StreamOutlet(emg_info)
-            
+
             # IMU outlet (orientation + accel + gyro = 10 channels at ~50 Hz)
             imu_info = pylsl.StreamInfo(
                 name=f"{self.stream_name}_IMU",
@@ -121,51 +202,51 @@ if HAS_MYO:
                 channel_format=pylsl.cf_float32,
                 source_id=f'{self.stream_name}_IMU'
             )
-            
+
             desc = imu_info.desc()
             desc.append_child_value("manufacturer", "Thalmic Labs")
             channels = desc.append_child("channels")
-            for label in ['Ori_W', 'Ori_X', 'Ori_Y', 'Ori_Z', 
-                         'Acc_X', 'Acc_Y', 'Acc_Z',
-                         'Gyro_X', 'Gyro_Y', 'Gyro_Z']:
+            for label in ['Ori_W', 'Ori_X', 'Ori_Y', 'Ori_Z',
+                          'Acc_X', 'Acc_Y', 'Acc_Z',
+                          'Gyro_X', 'Gyro_Y', 'Gyro_Z']:
                 ch = channels.append_child("channel")
                 ch.append_child_value("label", label)
-            
+
             self.imu_outlet = pylsl.StreamOutlet(imu_info)
-            
+
             print(f"Created LSL outlets: {self.stream_name}_EMG, {self.stream_name}_IMU")
-        
+
         def on_connect(self, device, timestamp, firmware_version):
             """Called when Myo connects."""
             print(f"Myo connected! Firmware: {firmware_version}")
-            device.set_stream_emg(myo.StreamEmg.enabled)
-            device.vibrate(myo.VibrationType.short)
-        
+            device.set_stream_emg(libmyo.StreamEmg.enabled)
+            device.vibrate(libmyo.VibrationType.short)
+
         def on_disconnect(self, device, timestamp):
             """Called when Myo disconnects."""
             print("Myo disconnected")
-        
+
         def on_arm_sync(self, device, timestamp, arm, x_direction, rotation, warmup_state):
             """Called when Myo syncs to an arm."""
             self.data.arm = arm.name
             self.data.synced = True
             print(f"Synced to {arm.name} arm")
-            device.vibrate(myo.VibrationType.medium)
-        
+            device.vibrate(libmyo.VibrationType.medium)
+
         def on_arm_unsync(self, device, timestamp):
             """Called when Myo unsyncs."""
             self.data.synced = False
             print("Myo unsynced")
-        
+
         def on_emg(self, device, timestamp, emg):
             """Called when EMG data is received (200 Hz)."""
             self.data.emg = list(emg)
             self.data.timestamp = timestamp
-            
+
             # Push to LSL
             self.emg_outlet.push_sample(self.data.emg)
             self.sample_count += 1
-        
+
         def on_orientation(self, device, timestamp, orientation):
             """Called when orientation data is received (~50 Hz)."""
             self.data.orientation = {
@@ -174,7 +255,7 @@ if HAS_MYO:
                 'y': orientation.y,
                 'z': orientation.z,
             }
-        
+
         def on_accelerometor(self, device, timestamp, acceleration):
             """Called when accelerometer data is received."""
             self.data.acceleration = {
@@ -182,7 +263,7 @@ if HAS_MYO:
                 'y': acceleration.y,
                 'z': acceleration.z,
             }
-        
+
         def on_gyroscope(self, device, timestamp, gyroscope):
             """Called when gyroscope data is received."""
             self.data.gyroscope = {
@@ -190,7 +271,7 @@ if HAS_MYO:
                 'y': gyroscope.y,
                 'z': gyroscope.z,
             }
-            
+
             # Push IMU data (after we have all components)
             imu_sample = [
                 self.data.orientation['w'],
@@ -210,7 +291,7 @@ if HAS_MYO:
 class MyoStreamer:
     """
     High-level interface for streaming Myo data to LSL.
-    
+
     Example
     -------
     >>> streamer = MyoStreamer()
@@ -218,78 +299,82 @@ class MyoStreamer:
     >>> # ... do something ...
     >>> streamer.stop()
     """
-    
+
     def __init__(self, stream_name: str = "Myo"):
         """
         Initialize the Myo streamer.
-        
+
         Parameters
         ----------
         stream_name : str
             Base name for the LSL streams
         """
         if not HAS_MYO:
+            error_msg = MYO_ERROR or "Myo SDK not available"
             raise ImportError(
-                "myo-python not available. Install with: pip install myo-python\n"
-                "Also ensure MyoConnect is installed and running."
+                f"{error_msg}\n\n"
+                "To fix this:\n"
+                "1. Install myo-python: pip install myo-python\n"
+                "2. Copy the Myo SDK to: sdk/myo-sdk-win-0.9.0/bin/\n"
+                "3. Ensure myo64.dll is in that folder\n"
+                "4. Make sure MyoConnect is installed and running"
             )
-        
+
         if not HAS_LSL:
             raise ImportError("pylsl not available. Install with: pip install pylsl")
-        
+
         self.stream_name = stream_name
         self.hub = None
         self.listener = None
         self._running = False
         self._thread = None
-    
+
     def start(self):
         """Start streaming Myo data to LSL."""
         if self._running:
             print("Already running!")
             return
-        
-        print("Initializing Myo SDK...")
-        myo.init()
-        
-        self.hub = myo.Hub()
+
+        print("Initializing Myo Hub...")
+
+        self.hub = libmyo.Hub()
         self.listener = MyoLSLListener(self.stream_name)
-        
+
         # Set locking policy to none (always unlocked)
-        self.hub.set_locking_policy(myo.LockingPolicy.none)
-        
+        self.hub.set_locking_policy(libmyo.LockingPolicy.none)
+
         self._running = True
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
-        
+
         print("Myo streamer started. Waiting for device...")
         print("Make sure MyoConnect is running and the armband is on.")
-    
+
     def _run_loop(self):
         """Main run loop."""
         while self._running:
             self.hub.run(self.listener.on_event, 100)
-    
+
     def stop(self):
         """Stop streaming."""
         self._running = False
-        
+
         if self._thread:
             self._thread.join(timeout=2.0)
-        
+
         if self.hub:
             self.hub.shutdown()
-        
+
         if self.listener:
             print(f"Streamed {self.listener.sample_count} EMG samples")
-        
+
         print("Myo streamer stopped")
-    
+
     @property
     def is_synced(self) -> bool:
         """Check if Myo is synced to an arm."""
         return self.listener and self.listener.data.synced
-    
+
     @property
     def sample_count(self) -> int:
         """Get the number of samples streamed."""
@@ -300,19 +385,19 @@ class MyoStreamer:
 class MockMyoStreamer:
     """
     Mock Myo streamer for testing without hardware.
-    
+
     Generates synthetic EMG-like data for testing the pipeline.
     """
-    
+
     def __init__(self, stream_name: str = "MockMyo"):
         if not HAS_LSL:
             raise ImportError("pylsl not available")
-        
+
         self.stream_name = stream_name
         self._running = False
         self._thread = None
         self.sample_count = 0
-        
+
         # Create LSL outlet
         info = pylsl.StreamInfo(
             name=f"{stream_name}_EMG",
@@ -322,27 +407,27 @@ class MockMyoStreamer:
             channel_format=pylsl.cf_float32,
             source_id=f'{stream_name}_EMG'
         )
-        
+
         desc = info.desc()
         channels = desc.append_child("channels")
         for i in range(8):
             ch = channels.append_child("channel")
-            ch.append_child_value("label", f"EMG_{i+1}")
-        
+            ch.append_child_value("label", f"EMG_{i + 1}")
+
         self.outlet = pylsl.StreamOutlet(info)
-    
+
     def start(self):
         """Start generating mock data."""
         self._running = True
         self._thread = threading.Thread(target=self._generate_data, daemon=True)
         self._thread.start()
         print(f"Mock Myo started: {self.stream_name}_EMG")
-    
+
     def _generate_data(self):
         """Generate synthetic EMG data."""
         t = 0
         dt = 1.0 / 200  # 200 Hz
-        
+
         while self._running:
             # Generate 8 channels of synthetic EMG
             # Mix of noise + some sinusoidal components
@@ -354,20 +439,20 @@ class MockMyoStreamer:
                 if np.random.random() < 0.01:
                     signal += 50 * np.random.randn()
                 sample.append(noise + signal)
-            
+
             self.outlet.push_sample(sample)
             self.sample_count += 1
             t += dt
-            
+
             time.sleep(dt * 0.95)  # Slight speedup to prevent drift
-    
+
     def stop(self):
         """Stop generating data."""
         self._running = False
         if self._thread:
             self._thread.join(timeout=1.0)
         print(f"Mock Myo stopped. Generated {self.sample_count} samples.")
-    
+
     @property
     def is_synced(self) -> bool:
         return self._running
@@ -376,13 +461,13 @@ class MockMyoStreamer:
 def main():
     """Command-line interface for Myo streaming."""
     import argparse
-    
+
     parser = argparse.ArgumentParser(description="Myo Armband LSL Streamer")
     parser.add_argument("--name", default="Myo", help="Stream name")
     parser.add_argument("--mock", action="store_true", help="Use mock data (no hardware)")
     parser.add_argument("--duration", type=float, default=0, help="Duration in seconds (0 = indefinite)")
     args = parser.parse_args()
-    
+
     if args.mock:
         streamer = MockMyoStreamer(args.name)
     else:
@@ -391,10 +476,10 @@ def main():
             print("To install: pip install myo-python")
             return 1
         streamer = MyoStreamer(args.name)
-    
+
     try:
         streamer.start()
-        
+
         if args.duration > 0:
             print(f"Running for {args.duration} seconds...")
             time.sleep(args.duration)
@@ -403,13 +488,13 @@ def main():
             while True:
                 time.sleep(1)
                 print(f"Samples: {streamer.sample_count}", end='\r')
-    
+
     except KeyboardInterrupt:
         print("\nStopping...")
-    
+
     finally:
         streamer.stop()
-    
+
     return 0
 
 
