@@ -28,6 +28,30 @@ import pandas as pd
 import pylsl
 
 
+# ============================================================================
+# pylsl API compatibility helpers (parameter names vary between versions)
+# ============================================================================
+
+def _resolve_streams(wait_time: float = 1.0):
+    """Resolve streams with API version compatibility."""
+    try:
+        # Try positional first (older API)
+        return pylsl.resolve_streams(wait_time)
+    except TypeError:
+        # Try keyword (newer API)
+        return pylsl.resolve_streams(wait_time=wait_time)
+
+
+def _resolve_byprop(prop: str, value: str, minimum: int = 1, timeout: float = 5.0):
+    """Resolve streams by property with API version compatibility."""
+    try:
+        # Try positional first (older API)
+        return pylsl.resolve_byprop(prop, value, minimum, timeout)
+    except TypeError:
+        # Try keyword (newer API)
+        return pylsl.resolve_byprop(prop, value, minimum=minimum, timeout=timeout)
+
+
 @dataclass
 class StreamInfo:
     """Information about an LSL stream."""
@@ -104,7 +128,7 @@ def discover_streams(timeout: float = 2.0) -> list[StreamInfo]:
     ...     print(s.name, s.type, s.channel_count)
     """
     print(f"Searching for LSL streams (waiting {timeout}s)...")
-    streams = pylsl.resolve_streams(timeout)
+    streams = _resolve_streams(timeout)
     
     results = []
     for stream in streams:
@@ -139,12 +163,12 @@ def find_stream(name: str = None, stream_type: str = None,
     """
     if name:
         print(f"Looking for stream with name containing '{name}'...")
-        streams = pylsl.resolve_byprop("name", name, timeout=timeout)
+        streams = _resolve_byprop("name", name, timeout=timeout)
     elif stream_type:
         print(f"Looking for stream of type '{stream_type}'...")
-        streams = pylsl.resolve_byprop("type", stream_type, timeout=timeout)
+        streams = _resolve_byprop("type", stream_type, timeout=timeout)
     else:
-        streams = pylsl.resolve_streams(timeout)
+        streams = _resolve_streams(timeout)
     
     if streams:
         return StreamInfo.from_pylsl(streams[0])
@@ -196,9 +220,9 @@ class LSLRecorder:
         """
         # Find the stream
         if name:
-            streams = pylsl.resolve_byprop("name", name, timeout=timeout)
+            streams = _resolve_byprop("name", name, timeout=timeout)
         elif stream_type:
-            streams = pylsl.resolve_byprop("type", stream_type, timeout=timeout)
+            streams = _resolve_byprop("type", stream_type, timeout=timeout)
         else:
             print("Error: Must specify name or stream_type")
             return False

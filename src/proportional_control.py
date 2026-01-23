@@ -48,6 +48,27 @@ except ImportError:
     HAS_LSL = False
 
 
+# pylsl API compatibility helpers
+def _resolve_streams(wait_time: float = 1.0):
+    """Resolve streams with API version compatibility."""
+    try:
+        # Try positional first (older API)
+        return pylsl.resolve_streams(wait_time)
+    except TypeError:
+        # Try keyword (newer API)
+        return pylsl.resolve_streams(wait_time=wait_time)
+
+
+def _resolve_byprop(prop: str, value: str, minimum: int = 1, timeout: float = 5.0):
+    """Resolve streams by property with API version compatibility."""
+    try:
+        # Try positional first (older API)
+        return pylsl.resolve_byprop(prop, value, minimum, timeout)
+    except TypeError:
+        # Try keyword (newer API)
+        return pylsl.resolve_byprop(prop, value, minimum=minimum, timeout=timeout)
+
+
 @dataclass
 class ControlConfig:
     """Configuration for proportional control."""
@@ -333,7 +354,7 @@ if HAS_GUI and HAS_LSL:
             self.stream_combo.addItem("Mock EMG (Testing)", "mock")
             
             # Scan for real streams
-            streams = pylsl.resolve_streams(timeout=1.0)
+            streams = _resolve_streams(1.0)
             for stream in streams:
                 name = stream.name()
                 self.stream_combo.addItem(f"{name} ({stream.type()})", name)
@@ -354,7 +375,7 @@ if HAS_GUI and HAS_LSL:
                 self.start_mock()
             else:
                 # Connect to real stream
-                streams = pylsl.resolve_byprop("name", stream_name, timeout=2.0)
+                streams = _resolve_byprop("name", stream_name, timeout=2.0)
                 if not streams:
                     return
                 

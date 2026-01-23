@@ -123,9 +123,11 @@ class LSLStreamReader(threading.Thread):
             # Find and connect to stream
             print(f"Looking for stream: {self.stream_name}")
             try:
-                streams = pylsl.resolve_byprop("name", self.stream_name, timeout=5.0)
-            except TypeError:
+                # Try positional first (older API)
                 streams = pylsl.resolve_byprop("name", self.stream_name, 1, 5.0)
+            except TypeError:
+                # Try keyword (newer API)
+                streams = pylsl.resolve_byprop("name", self.stream_name, timeout=5.0)
             
             if not streams:
                 self.error = f"Stream '{self.stream_name}' not found"
@@ -276,9 +278,11 @@ if HAS_GUI and HAS_LSL:
             try:
                 # Parameter name varies by pylsl version
                 try:
-                    streams = pylsl.resolve_streams(wait_time=2.0)
-                except TypeError:
+                    # Try positional first (older API)
                     streams = pylsl.resolve_streams(2.0)
+                except TypeError:
+                    # Try keyword (newer API)
+                    streams = pylsl.resolve_streams(wait_time=2.0)
                 
                 for stream in streams:
                     name = stream.name()
@@ -315,9 +319,11 @@ if HAS_GUI and HAS_LSL:
             
             # Get stream info
             try:
-                streams = pylsl.resolve_byprop("name", stream_name, timeout=2.0)
-            except TypeError:
+                # Try positional first (older API)
                 streams = pylsl.resolve_byprop("name", stream_name, 1, 2.0)
+            except TypeError:
+                # Try keyword (newer API)
+                streams = pylsl.resolve_byprop("name", stream_name, timeout=2.0)
             if not streams:
                 QMessageBox.warning(self, "Error", f"Stream '{stream_name}' not found")
                 return
