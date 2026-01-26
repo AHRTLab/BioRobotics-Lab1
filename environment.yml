@@ -25,7 +25,7 @@ dependencies:
   # Visualization
   - matplotlib>=3.7
   - pyqtgraph>=0.13
-  - pyqt6>=6.5
+ # - pyqt6>=6.5
   
   # Jupyter
   - jupyterlab>=4.0
@@ -34,7 +34,7 @@ dependencies:
   
   # LSL (Lab Streaming Layer)
   - liblsl>=1.16
-  - pylsl>=1.16
+  # - pylsl>=1.16
   
   # Data formats
   - pyxdf>=1.16  # XDF file format for LSL recordings
@@ -47,12 +47,25 @@ dependencies:
   
   # Pip-only packages
   - pip:
-    # Myo armband support - pyomyo communicates directly via Bluetooth (no SDK needed)
-    # IMPORTANT: Close MyoConnect before using!
-    - git+https://github.com/PerlinWarp/pyomyo.git
+    # Myo armband support - TWO BACKENDS AVAILABLE:
+    # 
+    # 1. dl-myo (RECOMMENDED): Native Bluetooth - NO DONGLE NEEDED
+    #    Works with computer's built-in Bluetooth
+    #    Supports connecting to specific Myo by MAC address
+    - dl-myo
+    
+    # 2. pyomyo (FALLBACK): Requires the blue Myo Bluetooth dongle
+    #    Uncomment if dl-myo doesn't work or you prefer using the dongle
+    # - git+https://github.com/PerlinWarp/pyomyo.git
+    
+    # IMPORTANT: Close MyoConnect before using either backend!
     
     # Signal processing
     - neurokit2>=0.2  # Biosignal processing toolkit
     
     # Testing
     - pytest>=7.0
+
+    - pyqt6
+    - pylsl
+    - dl-myo

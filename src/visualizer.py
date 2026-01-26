@@ -1,31 +1,35 @@
 """
-BioRobotics Lab 1 - Real-time EMG Visualizer
-=============================================
+BioRobotics Lab 1 - Real-time EMG/IMU Visualizer & Data Collector
+===================================================================
 
-A Python-based visualizer for EMG and other biosignals streamed via LSL.
-This replaces the need for BioCapture or other proprietary software.
+A Python-based visualizer for EMG and IMU biosignals streamed via LSL.
 
 Features:
+- Multi-stream support (EMG + IMU simultaneously)
 - Real-time multi-channel plotting
-- Adjustable time window
-- Signal quality indicators
-- Recording capabilities
-- Works without admin rights
+- Adjustable time window and amplitude
+- Signal envelope display (muscle activation)
+- Data collection with metadata (participant, gesture, trial)
+- Auto-incrementing trial numbers
+- Organized file output
 
 Usage:
     python visualizer.py                    # Auto-detect streams
-    python visualizer.py --stream "Myo"     # Connect to specific stream
+    python visualizer.py --stream "Myo"     # Connect to streams starting with "Myo"
+    python visualizer.py --mock             # Test with synthetic data
 
 Author: BioRobotics Course
 Updated: 2025
 """
 
 import sys
+import os
 import time
 import threading
 from collections import deque
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Optional, Dict, List
+from datetime import datetime
 
 import numpy as np
 
@@ -34,10 +38,12 @@ try:
     from PyQt6.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
         QPushButton, QComboBox, QLabel, QSpinBox, QStatusBar,
-        QGroupBox, QGridLayout, QCheckBox, QFileDialog, QMessageBox
+        QGroupBox, QGridLayout, QCheckBox, QFileDialog, QMessageBox,
+        QDoubleSpinBox, QLineEdit, QTabWidget, QListWidget, QListWidgetItem,
+        QSplitter, QFrame
     )
-    from PyQt6.QtCore import QTimer, Qt
-    from PyQt6.QtGui import QFont
+    from PyQt6.QtCore import QTimer, Qt, pyqtSignal
+    from PyQt6.QtGui import QFont, QColor
     import pyqtgraph as pg
     HAS_GUI = True
 except ImportError:
@@ -55,11 +61,26 @@ except ImportError:
 @dataclass
 class VisualizerConfig:
     """Configuration for the visualizer."""
-    window_seconds: float = 5.0  # Time window to display
-    update_rate_hz: float = 30.0  # Display update rate
-    max_channels: int = 16  # Maximum channels to display
+    window_seconds: float = 5.0
+    update_rate_hz: float = 30.0
+    max_channels: int = 16
     dark_mode: bool = True
+    emg_amplitude: float = 128.0
+    imu_amplitude: float = 2.0
+    auto_scale: bool = False
+    show_envelope: bool = False
+    envelope_window_ms: float = 50.0
+    line_width: int = 1
 
+
+@dataclass
+class RecordingMetadata:
+    """Metadata for recorded data."""
+    participant_id: str = ""
+    gesture: str = ""
+    trial_number: int = 1
+    notes: str = ""
+    
 
 class SignalBuffer:
     """Thread-safe buffer for streaming signal data."""
@@ -80,7 +101,7 @@ class SignalBuffer:
                 if i < len(timestamps):
                     self.timestamps.append(timestamps[i])
     
-    def get_data(self, n_samples: int = None) -> tuple[np.ndarray, np.ndarray]:
+    def get_data(self, n_samples: int = None) -> tuple:
         """Get data from the buffer."""
         with self._lock:
             if n_samples is None:
@@ -112,6 +133,7 @@ class LSLStreamReader(threading.Thread):
         self.running = False
         self.inlet = None
         self.sample_count = 0
+        self.sample_rate = 200
         self.error = None
     
     def run(self):
@@ -120,13 +142,10 @@ class LSLStreamReader(threading.Thread):
         self.sample_count = 0
         
         try:
-            # Find and connect to stream
             print(f"Looking for stream: {self.stream_name}")
             try:
-                # Try positional first (older API)
                 streams = pylsl.resolve_byprop("name", self.stream_name, 1, 5.0)
             except TypeError:
-                # Try keyword (newer API)
                 streams = pylsl.resolve_byprop("name", self.stream_name, timeout=5.0)
             
             if not streams:
@@ -134,10 +153,10 @@ class LSLStreamReader(threading.Thread):
                 self.running = False
                 return
             
+            self.sample_rate = streams[0].nominal_srate()
             self.inlet = pylsl.StreamInlet(streams[0], max_buflen=360)
-            print(f"Connected to {self.stream_name}")
+            print(f"Connected to {self.stream_name} ({self.sample_rate} Hz)")
             
-            # Read data
             while self.running:
                 samples, timestamps = self.inlet.pull_chunk(timeout=0.1)
                 if samples:
@@ -155,133 +174,311 @@ class LSLStreamReader(threading.Thread):
         self.running = False
 
 
+def compute_envelope(data: np.ndarray, window_samples: int) -> np.ndarray:
+    """Compute signal envelope (rectify + smooth)."""
+    if window_samples < 1:
+        window_samples = 1
+    
+    rectified = np.abs(data)
+    
+    if len(rectified) < window_samples:
+        return rectified
+    
+    envelope = np.zeros_like(rectified)
+    for ch in range(rectified.shape[1]):
+        cumsum = np.cumsum(np.insert(rectified[:, ch], 0, 0))
+        envelope[window_samples-1:, ch] = (cumsum[window_samples:] - cumsum[:-window_samples]) / window_samples
+        envelope[:window_samples-1, ch] = envelope[window_samples-1, ch]
+    
+    return envelope
+
+
 if HAS_GUI and HAS_LSL:
     
-    class EMGVisualizer(QMainWindow):
-        """Main visualizer window."""
+    class StreamPanel(QWidget):
+        """Panel for displaying a single stream."""
         
-        def __init__(self, config: VisualizerConfig = None):
-            super().__init__()
-            self.config = config or VisualizerConfig()
+        def __init__(self, stream_type: str = "EMG", n_channels: int = 8, parent=None):
+            super().__init__(parent)
+            self.stream_type = stream_type
+            self.n_channels = n_channels
+            self.plots = []
+            self.curves = []
+            self.envelope_curves = []
             
-            # State
-            self.stream_reader: Optional[LSLStreamReader] = None
-            self.buffer: Optional[SignalBuffer] = None
-            self.recording = False
-            self.record_data = []
-            self.record_timestamps = []
-            
-            # Setup UI
             self.setup_ui()
-            self.setup_plots()
-            
-            # Update timer
-            self.timer = QTimer()
-            self.timer.timeout.connect(self.update_plots)
-            
-            # Refresh available streams
-            self.refresh_streams()
         
         def setup_ui(self):
-            """Create the user interface."""
-            self.setWindowTitle("BioRobotics EMG Visualizer")
-            self.setGeometry(100, 100, 1200, 800)
+            layout = QVBoxLayout(self)
+            layout.setContentsMargins(0, 0, 0, 0)
             
-            # Apply dark theme if configured
-            if self.config.dark_mode:
-                pg.setConfigOption('background', '#1e1e1e')
-                pg.setConfigOption('foreground', '#ffffff')
-            
-            # Central widget
-            central = QWidget()
-            self.setCentralWidget(central)
-            layout = QVBoxLayout(central)
-            
-            # === Control Panel ===
-            control_group = QGroupBox("Controls")
-            control_layout = QGridLayout(control_group)
-            
-            # Stream selection
-            control_layout.addWidget(QLabel("Stream:"), 0, 0)
-            self.stream_combo = QComboBox()
-            self.stream_combo.setMinimumWidth(200)
-            control_layout.addWidget(self.stream_combo, 0, 1)
-            
-            self.refresh_btn = QPushButton("🔄 Refresh")
-            self.refresh_btn.clicked.connect(self.refresh_streams)
-            control_layout.addWidget(self.refresh_btn, 0, 2)
-            
-            self.connect_btn = QPushButton("▶ Connect")
-            self.connect_btn.clicked.connect(self.toggle_connection)
-            control_layout.addWidget(self.connect_btn, 0, 3)
-            
-            # Time window
-            control_layout.addWidget(QLabel("Window (s):"), 0, 4)
-            self.window_spin = QSpinBox()
-            self.window_spin.setRange(1, 30)
-            self.window_spin.setValue(int(self.config.window_seconds))
-            self.window_spin.valueChanged.connect(self.update_window)
-            control_layout.addWidget(self.window_spin, 0, 5)
-            
-            # Recording
-            self.record_btn = QPushButton("⏺ Record")
-            self.record_btn.clicked.connect(self.toggle_recording)
-            self.record_btn.setEnabled(False)
-            control_layout.addWidget(self.record_btn, 0, 6)
-            
-            self.save_btn = QPushButton("💾 Save")
-            self.save_btn.clicked.connect(self.save_recording)
-            self.save_btn.setEnabled(False)
-            control_layout.addWidget(self.save_btn, 0, 7)
-            
-            layout.addWidget(control_group)
-            
-            # === Plot Area ===
             self.plot_widget = pg.GraphicsLayoutWidget()
-            layout.addWidget(self.plot_widget, stretch=1)
-            
-            # === Status Bar ===
-            self.status_bar = QStatusBar()
-            self.setStatusBar(self.status_bar)
-            self.status_label = QLabel("Not connected")
-            self.sample_label = QLabel("Samples: 0")
-            self.status_bar.addWidget(self.status_label)
-            self.status_bar.addPermanentWidget(self.sample_label)
+            layout.addWidget(self.plot_widget)
         
-        def setup_plots(self, n_channels: int = 8):
-            """Setup the plot widgets."""
+        def setup_plots(self, n_channels: int, amplitude: float, window_seconds: float,
+                       line_width: int = 1, show_envelope: bool = False):
+            """Setup plot widgets."""
             self.plot_widget.clear()
             self.plots = []
             self.curves = []
+            self.envelope_curves = []
+            self.n_channels = n_channels
+            
+            # Color palettes
+            emg_colors = [
+                '#e6194b', '#3cb44b', '#ffe119', '#4363d8',
+                '#f58231', '#911eb4', '#42d4f4', '#f032e6'
+            ]
+            imu_colors = [
+                '#ff6b6b', '#4ecdc4', '#45b7d1', '#96ceb4',  # Quaternion
+                '#ffeaa7', '#dfe6e9', '#fd79a8',  # Accel
+                '#a29bfe', '#6c5ce7', '#00b894'   # Gyro
+            ]
+            
+            colors = emg_colors if self.stream_type == "EMG" else imu_colors
+            
+            # Channel labels
+            if self.stream_type == "EMG":
+                labels = [f"EMG {i+1}" for i in range(n_channels)]
+            else:
+                labels = ["Quat W", "Quat X", "Quat Y", "Quat Z",
+                         "Accel X", "Accel Y", "Accel Z",
+                         "Gyro X", "Gyro Y", "Gyro Z"][:n_channels]
             
             for i in range(n_channels):
                 if i > 0:
                     self.plot_widget.nextRow()
                 
-                plot = self.plot_widget.addPlot(title=f"Channel {i+1}")
-                plot.setLabel('left', 'Amplitude')
-                plot.setLabel('bottom', 'Time (s)')
+                plot = self.plot_widget.addPlot(title=labels[i])
                 plot.showGrid(x=True, y=True, alpha=0.3)
-                plot.setYRange(-1, 1)
+                plot.setXRange(-window_seconds, 0)
+                plot.setYRange(-amplitude, amplitude)
                 
-                curve = plot.plot(pen=pg.mkPen(color=pg.intColor(i, hues=n_channels), width=1))
+                if i == n_channels - 1:
+                    plot.setLabel('bottom', 'Time (s)')
+                
+                color = colors[i % len(colors)]
+                curve = plot.plot(pen=pg.mkPen(color=color, width=line_width))
+                
+                env_curve = plot.plot(pen=pg.mkPen(color='#ffffff', width=2))
+                env_curve.setVisible(show_envelope)
                 
                 self.plots.append(plot)
                 self.curves.append(curve)
+                self.envelope_curves.append(env_curve)
+        
+        def update_amplitude(self, amplitude: float):
+            """Update Y-axis range."""
+            for plot in self.plots:
+                plot.setYRange(-amplitude, amplitude)
+        
+        def update_window(self, window_seconds: float):
+            """Update X-axis range."""
+            for plot in self.plots:
+                plot.setXRange(-window_seconds, 0)
+
+
+    class EMGVisualizer(QMainWindow):
+        """Main visualizer window with multi-stream and data collection support."""
+        
+        def __init__(self, config: VisualizerConfig = None):
+            super().__init__()
+            self.config = config or VisualizerConfig()
+            
+            # Stream state
+            self.streams: Dict[str, dict] = {}  # name -> {reader, buffer, panel, info}
+            self.recording = False
+            self.record_data: Dict[str, list] = {}  # stream_name -> [data chunks]
+            self.record_timestamps: Dict[str, list] = {}
+            self.record_start_time = None
+            
+            # Metadata
+            self.metadata = RecordingMetadata()
+            
+            # Output directory
+            self.output_dir = os.path.join(os.getcwd(), "recordings")
+            
+            # Setup UI
+            self.setup_ui()
+            
+            # Update timer
+            self.timer = QTimer()
+            self.timer.timeout.connect(self.update_plots)
+            
+            # Rate tracking
+            self.last_counts = {}
+            self.last_rate_time = time.time()
+            
+            # Refresh streams
+            self.refresh_streams()
+        
+        def setup_ui(self):
+            """Create the user interface."""
+            self.setWindowTitle("BioRobotics EMG/IMU Visualizer & Data Collector")
+            self.setGeometry(100, 100, 1400, 900)
+            
+            if self.config.dark_mode:
+                pg.setConfigOption('background', '#1e1e1e')
+                pg.setConfigOption('foreground', '#ffffff')
+            
+            central = QWidget()
+            self.setCentralWidget(central)
+            main_layout = QHBoxLayout(central)
+            
+            # === Left Panel: Controls & Data Collection ===
+            left_panel = QWidget()
+            left_panel.setMaximumWidth(350)
+            left_panel.setMinimumWidth(300)
+            left_layout = QVBoxLayout(left_panel)
+            
+            # -- Stream Selection --
+            stream_group = QGroupBox("Streams")
+            stream_layout = QVBoxLayout(stream_group)
+            
+            refresh_row = QHBoxLayout()
+            self.refresh_btn = QPushButton("🔄 Scan for Streams")
+            self.refresh_btn.clicked.connect(self.refresh_streams)
+            refresh_row.addWidget(self.refresh_btn)
+            stream_layout.addLayout(refresh_row)
+            
+            self.stream_list = QListWidget()
+            self.stream_list.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
+            self.stream_list.setMaximumHeight(120)
+            stream_layout.addWidget(self.stream_list)
+            
+            connect_row = QHBoxLayout()
+            self.connect_btn = QPushButton("▶ Connect Selected")
+            self.connect_btn.clicked.connect(self.toggle_connection)
+            connect_row.addWidget(self.connect_btn)
+            stream_layout.addLayout(connect_row)
+            
+            left_layout.addWidget(stream_group)
+            
+            # -- Data Collection --
+            collect_group = QGroupBox("Data Collection")
+            collect_layout = QGridLayout(collect_group)
+            
+            collect_layout.addWidget(QLabel("Participant ID:"), 0, 0)
+            self.participant_edit = QLineEdit()
+            self.participant_edit.setPlaceholderText("e.g., P01")
+            self.participant_edit.textChanged.connect(self.update_metadata)
+            collect_layout.addWidget(self.participant_edit, 0, 1)
+            
+            collect_layout.addWidget(QLabel("Gesture:"), 1, 0)
+            self.gesture_combo = QComboBox()
+            self.gesture_combo.setEditable(True)
+            self.gesture_combo.addItems([
+                "rest", "fist", "open", "wrist_flexion", "wrist_extension",
+                "pronation", "supination", "pinch", "point", "custom"
+            ])
+            self.gesture_combo.currentTextChanged.connect(self.update_metadata)
+            collect_layout.addWidget(self.gesture_combo, 1, 1)
+            
+            collect_layout.addWidget(QLabel("Trial #:"), 2, 0)
+            self.trial_spin = QSpinBox()
+            self.trial_spin.setRange(1, 999)
+            self.trial_spin.setValue(1)
+            self.trial_spin.valueChanged.connect(self.update_metadata)
+            collect_layout.addWidget(self.trial_spin, 2, 1)
+            
+            collect_layout.addWidget(QLabel("Output Dir:"), 3, 0)
+            dir_row = QHBoxLayout()
+            self.dir_label = QLabel(self.output_dir)
+            self.dir_label.setWordWrap(True)
+            self.dir_label.setStyleSheet("color: #888; font-size: 10px;")
+            dir_row.addWidget(self.dir_label)
+            self.dir_btn = QPushButton("📁")
+            self.dir_btn.setMaximumWidth(30)
+            self.dir_btn.clicked.connect(self.select_output_dir)
+            dir_row.addWidget(self.dir_btn)
+            collect_layout.addLayout(dir_row, 3, 1)
+            
+            # Record button
+            self.record_btn = QPushButton("⏺ START RECORDING")
+            self.record_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #2d5a27;
+                    color: white;
+                    font-weight: bold;
+                    padding: 15px;
+                    font-size: 14px;
+                }
+                QPushButton:hover {
+                    background-color: #3d7a37;
+                }
+                QPushButton:disabled {
+                    background-color: #555;
+                }
+            """)
+            self.record_btn.clicked.connect(self.toggle_recording)
+            self.record_btn.setEnabled(False)
+            collect_layout.addWidget(self.record_btn, 4, 0, 1, 2)
+            
+            # Recording status
+            self.record_status = QLabel("Not recording")
+            self.record_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            collect_layout.addWidget(self.record_status, 5, 0, 1, 2)
+            
+            left_layout.addWidget(collect_group)
+            
+            # -- Display Settings --
+            display_group = QGroupBox("Display Settings")
+            display_layout = QGridLayout(display_group)
+            
+            display_layout.addWidget(QLabel("Time (s):"), 0, 0)
+            self.window_spin = QSpinBox()
+            self.window_spin.setRange(1, 30)
+            self.window_spin.setValue(int(self.config.window_seconds))
+            self.window_spin.valueChanged.connect(self.update_window)
+            display_layout.addWidget(self.window_spin, 0, 1)
+            
+            display_layout.addWidget(QLabel("EMG Amp (±):"), 1, 0)
+            self.emg_amp_spin = QDoubleSpinBox()
+            self.emg_amp_spin.setRange(1, 10000)
+            self.emg_amp_spin.setValue(self.config.emg_amplitude)
+            self.emg_amp_spin.valueChanged.connect(self.update_emg_amplitude)
+            display_layout.addWidget(self.emg_amp_spin, 1, 1)
+            
+            display_layout.addWidget(QLabel("IMU Amp (±):"), 2, 0)
+            self.imu_amp_spin = QDoubleSpinBox()
+            self.imu_amp_spin.setRange(0.1, 1000)
+            self.imu_amp_spin.setValue(self.config.imu_amplitude)
+            self.imu_amp_spin.valueChanged.connect(self.update_imu_amplitude)
+            display_layout.addWidget(self.imu_amp_spin, 2, 1)
+            
+            self.envelope_check = QCheckBox("Show Envelope")
+            self.envelope_check.setChecked(self.config.show_envelope)
+            self.envelope_check.stateChanged.connect(self.toggle_envelope)
+            display_layout.addWidget(self.envelope_check, 3, 0, 1, 2)
+            
+            left_layout.addWidget(display_group)
+            
+            left_layout.addStretch()
+            
+            main_layout.addWidget(left_panel)
+            
+            # === Right Panel: Plots ===
+            self.plot_tabs = QTabWidget()
+            main_layout.addWidget(self.plot_tabs, stretch=1)
+            
+            # === Status Bar ===
+            self.status_bar = QStatusBar()
+            self.setStatusBar(self.status_bar)
+            self.status_label = QLabel("Not connected")
+            self.rate_label = QLabel("")
+            self.status_bar.addWidget(self.status_label)
+            self.status_bar.addPermanentWidget(self.rate_label)
         
         def refresh_streams(self):
             """Scan for available LSL streams."""
-            self.stream_combo.clear()
-            self.status_label.setText("Scanning for streams...")
+            self.stream_list.clear()
+            self.status_label.setText("Scanning...")
             QApplication.processEvents()
             
             try:
-                # Parameter name varies by pylsl version
                 try:
-                    # Try positional first (older API)
                     streams = pylsl.resolve_streams(2.0)
                 except TypeError:
-                    # Try keyword (newer API)
                     streams = pylsl.resolve_streams(wait_time=2.0)
                 
                 for stream in streams:
@@ -289,10 +486,15 @@ if HAS_GUI and HAS_LSL:
                     stype = stream.type()
                     n_ch = stream.channel_count()
                     rate = stream.nominal_srate()
-                    self.stream_combo.addItem(
-                        f"{name} ({stype}, {n_ch}ch, {rate}Hz)",
-                        name
-                    )
+                    
+                    item = QListWidgetItem(f"{name} ({stype}, {n_ch}ch, {rate:.0f}Hz)")
+                    item.setData(Qt.ItemDataRole.UserRole, {
+                        'name': name,
+                        'type': stype,
+                        'channels': n_ch,
+                        'rate': rate
+                    })
+                    self.stream_list.addItem(item)
                 
                 if streams:
                     self.status_label.setText(f"Found {len(streams)} stream(s)")
@@ -303,149 +505,347 @@ if HAS_GUI and HAS_LSL:
                 self.status_label.setText(f"Error: {e}")
         
         def toggle_connection(self):
-            """Connect or disconnect from stream."""
-            if self.stream_reader and self.stream_reader.running:
-                self.disconnect_stream()
+            """Connect or disconnect from streams."""
+            if self.streams:
+                self.disconnect_streams()
             else:
-                self.connect_stream()
+                self.connect_streams()
         
-        def connect_stream(self):
-            """Connect to the selected stream."""
-            if self.stream_combo.currentIndex() < 0:
-                QMessageBox.warning(self, "Error", "No stream selected")
+        def connect_streams(self):
+            """Connect to selected streams."""
+            selected = self.stream_list.selectedItems()
+            if not selected:
+                QMessageBox.warning(self, "Error", "No streams selected")
                 return
             
-            stream_name = self.stream_combo.currentData()
+            # Clear existing tabs
+            while self.plot_tabs.count() > 0:
+                self.plot_tabs.removeTab(0)
             
-            # Get stream info
-            try:
-                # Try positional first (older API)
-                streams = pylsl.resolve_byprop("name", stream_name, 1, 2.0)
-            except TypeError:
-                # Try keyword (newer API)
-                streams = pylsl.resolve_byprop("name", stream_name, timeout=2.0)
-            if not streams:
-                QMessageBox.warning(self, "Error", f"Stream '{stream_name}' not found")
-                return
+            for item in selected:
+                info = item.data(Qt.ItemDataRole.UserRole)
+                name = info['name']
+                stype = info['type']
+                n_channels = info['channels']
+                rate = info['rate']
+                
+                # Create buffer
+                max_samples = int(self.config.window_seconds * rate * 2)
+                buffer = SignalBuffer(n_channels, max_samples)
+                
+                # Create panel
+                panel = StreamPanel(stream_type=stype, n_channels=n_channels)
+                
+                # Determine amplitude based on type
+                if 'EMG' in stype.upper() or 'EMG' in name.upper():
+                    amplitude = self.config.emg_amplitude
+                    panel.stream_type = "EMG"
+                else:
+                    amplitude = self.config.imu_amplitude
+                    panel.stream_type = "IMU"
+                
+                panel.setup_plots(
+                    n_channels=n_channels,
+                    amplitude=amplitude,
+                    window_seconds=self.config.window_seconds,
+                    line_width=self.config.line_width,
+                    show_envelope=self.config.show_envelope
+                )
+                
+                # Add tab
+                tab_name = name.replace("_", " ")
+                self.plot_tabs.addTab(panel, tab_name)
+                
+                # Start reader
+                reader = LSLStreamReader(name, buffer)
+                reader.start()
+                
+                # Store
+                self.streams[name] = {
+                    'reader': reader,
+                    'buffer': buffer,
+                    'panel': panel,
+                    'info': info
+                }
+                self.last_counts[name] = 0
             
-            n_channels = min(streams[0].channel_count(), self.config.max_channels)
-            sample_rate = streams[0].nominal_srate()
-            
-            # Setup buffer and plots
-            max_samples = int(self.config.window_seconds * sample_rate * 2)
-            self.buffer = SignalBuffer(n_channels, max_samples)
-            self.setup_plots(n_channels)
-            
-            # Start reader thread
-            self.stream_reader = LSLStreamReader(stream_name, self.buffer)
-            self.stream_reader.start()
-            
-            # Start update timer
+            # Start timer
             interval_ms = int(1000 / self.config.update_rate_hz)
             self.timer.start(interval_ms)
+            self.last_rate_time = time.time()
             
             # Update UI
             self.connect_btn.setText("⏹ Disconnect")
             self.record_btn.setEnabled(True)
-            self.status_label.setText(f"Connected to {stream_name}")
+            self.status_label.setText(f"Connected to {len(self.streams)} stream(s)")
         
-        def disconnect_stream(self):
-            """Disconnect from the current stream."""
+        def disconnect_streams(self):
+            """Disconnect from all streams."""
             self.timer.stop()
             
-            if self.stream_reader:
-                self.stream_reader.stop()
-                self.stream_reader.join(timeout=1.0)
-                self.stream_reader = None
+            if self.recording:
+                self.toggle_recording()
             
-            self.connect_btn.setText("▶ Connect")
+            for name, stream in self.streams.items():
+                stream['reader'].stop()
+                stream['reader'].join(timeout=1.0)
+            
+            self.streams.clear()
+            self.last_counts.clear()
+            
+            self.connect_btn.setText("▶ Connect Selected")
             self.record_btn.setEnabled(False)
             self.status_label.setText("Disconnected")
+            self.rate_label.setText("")
         
         def update_plots(self):
-            """Update the plots with new data."""
-            if not self.buffer:
-                return
+            """Update all stream plots."""
+            rate_parts = []
             
-            # Get data
-            data, timestamps = self.buffer.get_data()
+            for name, stream in self.streams.items():
+                buffer = stream['buffer']
+                panel = stream['panel']
+                reader = stream['reader']
+                
+                data, timestamps = buffer.get_data()
+                
+                if len(timestamps) < 2:
+                    continue
+                
+                # Time axis relative to now
+                t_now = timestamps[-1]
+                t_rel = timestamps - t_now
+                
+                # Compute envelope if needed
+                envelope = None
+                if self.config.show_envelope and panel.stream_type == "EMG":
+                    sample_rate = reader.sample_rate or 200
+                    window_samples = max(1, int(self.config.envelope_window_ms * sample_rate / 1000))
+                    envelope = compute_envelope(data, window_samples)
+                
+                # Update curves
+                for i, curve in enumerate(panel.curves):
+                    if i < data.shape[1]:
+                        curve.setData(t_rel, data[:, i])
+                        
+                        if envelope is not None and i < len(panel.envelope_curves):
+                            panel.envelope_curves[i].setData(t_rel, envelope[:, i])
+                
+                # Recording
+                if self.recording:
+                    self.record_data[name].append(data.copy())
+                    self.record_timestamps[name].append(timestamps.copy())
+                
+                # Rate calculation
+                current_count = reader.sample_count
+                rate_parts.append(f"{name.split('_')[-1]}: {current_count}")
             
-            if len(timestamps) < 2:
-                return
+            # Update rate display
+            now = time.time()
+            dt = now - self.last_rate_time
+            if dt >= 1.0:
+                rates = []
+                for name, stream in self.streams.items():
+                    current = stream['reader'].sample_count
+                    rate = (current - self.last_counts.get(name, 0)) / dt
+                    rates.append(f"{name.split('_')[-1]}: {rate:.0f}Hz")
+                    self.last_counts[name] = current
+                self.rate_label.setText(" | ".join(rates))
+                self.last_rate_time = now
             
-            # Calculate time axis relative to now
-            t_now = timestamps[-1]
-            t_rel = timestamps - t_now
-            
-            # Update sample count
-            if self.stream_reader:
-                self.sample_label.setText(f"Samples: {self.stream_reader.sample_count}")
-            
-            # Update each channel
-            for i, curve in enumerate(self.curves):
-                if i < data.shape[1]:
-                    curve.setData(t_rel, data[:, i])
-                    
-                    # Auto-scale Y axis
-                    if len(data) > 10:
-                        ch_data = data[:, i]
-                        y_range = max(abs(ch_data.min()), abs(ch_data.max()), 0.1) * 1.2
-                        self.plots[i].setYRange(-y_range, y_range)
-            
-            # Recording
-            if self.recording:
-                self.record_data.append(data.copy())
-                self.record_timestamps.append(timestamps.copy())
+            # Recording duration
+            if self.recording and self.record_start_time:
+                duration = time.time() - self.record_start_time
+                self.record_status.setText(f"🔴 Recording: {duration:.1f}s")
         
-        def update_window(self, value):
-            """Update the time window."""
-            self.config.window_seconds = float(value)
-            for plot in self.plots:
-                plot.setXRange(-value, 0)
+        def update_metadata(self):
+            """Update metadata from UI."""
+            self.metadata.participant_id = self.participant_edit.text()
+            self.metadata.gesture = self.gesture_combo.currentText()
+            self.metadata.trial_number = self.trial_spin.value()
+        
+        def select_output_dir(self):
+            """Select output directory."""
+            dir_path = QFileDialog.getExistingDirectory(self, "Select Output Directory")
+            if dir_path:
+                self.output_dir = dir_path
+                self.dir_label.setText(dir_path)
         
         def toggle_recording(self):
             """Start or stop recording."""
             if self.recording:
-                self.recording = False
-                self.record_btn.setText("⏺ Record")
-                self.save_btn.setEnabled(True)
-                self.status_label.setText("Recording stopped")
+                self.stop_recording()
             else:
-                self.record_data.clear()
-                self.record_timestamps.clear()
-                self.recording = True
-                self.record_btn.setText("⏹ Stop")
-                self.save_btn.setEnabled(False)
-                self.status_label.setText("Recording...")
+                self.start_recording()
         
-        def save_recording(self):
-            """Save the recording to a file."""
-            if not self.record_data:
-                QMessageBox.warning(self, "Error", "No data to save")
+        def start_recording(self):
+            """Start recording data."""
+            self.update_metadata()
+            
+            if not self.metadata.participant_id:
+                QMessageBox.warning(self, "Error", "Please enter a Participant ID")
                 return
             
-            filename, _ = QFileDialog.getSaveFileName(
-                self, "Save Recording", "", "CSV Files (*.csv);;All Files (*)"
-            )
+            # Initialize recording buffers
+            self.record_data.clear()
+            self.record_timestamps.clear()
+            for name in self.streams:
+                self.record_data[name] = []
+                self.record_timestamps[name] = []
             
-            if filename:
-                import pandas as pd
+            self.recording = True
+            self.record_start_time = time.time()
+            
+            self.record_btn.setText("⏹ STOP RECORDING")
+            self.record_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #8b0000;
+                    color: white;
+                    font-weight: bold;
+                    padding: 15px;
+                    font-size: 14px;
+                }
+                QPushButton:hover {
+                    background-color: #a00000;
+                }
+            """)
+            self.record_status.setText("🔴 Recording...")
+        
+        def stop_recording(self):
+            """Stop recording and save data."""
+            self.recording = False
+            duration = time.time() - self.record_start_time if self.record_start_time else 0
+            
+            self.record_btn.setText("⏺ START RECORDING")
+            self.record_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #2d5a27;
+                    color: white;
+                    font-weight: bold;
+                    padding: 15px;
+                    font-size: 14px;
+                }
+                QPushButton:hover {
+                    background-color: #3d7a37;
+                }
+            """)
+            
+            # Save data
+            saved_files = self.save_recording()
+            
+            if saved_files:
+                self.record_status.setText(f"✓ Saved {len(saved_files)} file(s) ({duration:.1f}s)")
                 
-                # Concatenate all data
-                all_data = np.vstack(self.record_data)
-                all_timestamps = np.concatenate(self.record_timestamps)
+                # Auto-increment trial number
+                self.trial_spin.setValue(self.metadata.trial_number + 1)
+            else:
+                self.record_status.setText("No data to save")
+        
+        def save_recording(self) -> List[str]:
+            """Save recorded data to CSV files."""
+            saved_files = []
+            
+            # Create output directory
+            os.makedirs(self.output_dir, exist_ok=True)
+            
+            # Timestamp for filename
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            
+            for stream_name, data_chunks in self.record_data.items():
+                if not data_chunks:
+                    continue
                 
-                # Create DataFrame
-                columns = [f"ch_{i+1}" for i in range(all_data.shape[1])]
-                df = pd.DataFrame(all_data, columns=columns)
-                df.insert(0, 'timestamp', all_timestamps[:len(df)])
+                # Concatenate data
+                try:
+                    all_data = np.vstack(data_chunks)
+                    all_timestamps = np.concatenate(self.record_timestamps[stream_name])
+                except:
+                    continue
                 
-                df.to_csv(filename, index=False)
-                self.status_label.setText(f"Saved to {filename}")
+                if len(all_data) == 0:
+                    continue
+                
+                # Determine stream type from name
+                if 'EMG' in stream_name.upper():
+                    stream_type = 'emg'
+                    columns = [f'emg_{i+1}' for i in range(all_data.shape[1])]
+                elif 'IMU' in stream_name.upper():
+                    stream_type = 'imu'
+                    columns = ['quat_w', 'quat_x', 'quat_y', 'quat_z',
+                              'accel_x', 'accel_y', 'accel_z',
+                              'gyro_x', 'gyro_y', 'gyro_z'][:all_data.shape[1]]
+                else:
+                    stream_type = 'data'
+                    columns = [f'ch_{i+1}' for i in range(all_data.shape[1])]
+                
+                # Build filename
+                parts = [
+                    self.metadata.participant_id,
+                    self.metadata.gesture,
+                    f"trial{self.metadata.trial_number:03d}",
+                    stream_type,
+                    timestamp
+                ]
+                filename = "_".join(p for p in parts if p) + ".csv"
+                filepath = os.path.join(self.output_dir, filename)
+                
+                # Save with metadata header
+                with open(filepath, 'w') as f:
+                    f.write(f"# participant_id: {self.metadata.participant_id}\n")
+                    f.write(f"# gesture: {self.metadata.gesture}\n")
+                    f.write(f"# trial_number: {self.metadata.trial_number}\n")
+                    f.write(f"# stream_name: {stream_name}\n")
+                    f.write(f"# stream_type: {stream_type}\n")
+                    f.write(f"# timestamp: {timestamp}\n")
+                    f.write(f"# samples: {len(all_data)}\n")
+                    f.write(f"# duration_sec: {all_timestamps[-1] - all_timestamps[0]:.3f}\n")
+                    f.write("#\n")
+                    
+                    # Header row
+                    f.write("timestamp," + ",".join(columns) + "\n")
+                    
+                    # Data rows
+                    for i in range(len(all_data)):
+                        ts = all_timestamps[i] if i < len(all_timestamps) else 0
+                        row = [f"{ts:.6f}"] + [f"{v:.6f}" for v in all_data[i]]
+                        f.write(",".join(row) + "\n")
+                
+                saved_files.append(filepath)
+                print(f"Saved: {filepath}")
+            
+            return saved_files
+        
+        def update_window(self, value):
+            """Update time window."""
+            self.config.window_seconds = float(value)
+            for stream in self.streams.values():
+                stream['panel'].update_window(value)
+        
+        def update_emg_amplitude(self, value):
+            """Update EMG amplitude."""
+            self.config.emg_amplitude = value
+            for stream in self.streams.values():
+                if stream['panel'].stream_type == "EMG":
+                    stream['panel'].update_amplitude(value)
+        
+        def update_imu_amplitude(self, value):
+            """Update IMU amplitude."""
+            self.config.imu_amplitude = value
+            for stream in self.streams.values():
+                if stream['panel'].stream_type == "IMU":
+                    stream['panel'].update_amplitude(value)
+        
+        def toggle_envelope(self, state):
+            """Toggle envelope display."""
+            self.config.show_envelope = bool(state)
+            for stream in self.streams.values():
+                panel = stream['panel']
+                for env_curve in panel.envelope_curves:
+                    env_curve.setVisible(self.config.show_envelope)
         
         def closeEvent(self, event):
             """Handle window close."""
-            self.disconnect_stream()
+            self.disconnect_streams()
             event.accept()
 
 
@@ -462,93 +862,120 @@ def main():
         return 1
     
     import argparse
-    parser = argparse.ArgumentParser(description="EMG Visualizer")
-    parser.add_argument("--stream", help="Stream name to connect to")
+    parser = argparse.ArgumentParser(description="EMG/IMU Visualizer & Data Collector")
+    parser.add_argument("--stream", help="Auto-select streams containing this name")
     parser.add_argument("--dark", action="store_true", default=True, help="Dark mode")
-    parser.add_argument("--mock", action="store_true", help="Create internal mock stream for testing")
+    parser.add_argument("--mock", action="store_true", help="Start mock streams for testing")
+    parser.add_argument("--output", help="Output directory for recordings")
     args = parser.parse_args()
     
-    # Start mock stream if requested
-    mock_thread = None
-    mock_outlet = None
+    # Start mock streams if requested
+    mock_threads = []
     if args.mock:
-        print("Starting internal mock EMG stream...")
-        mock_outlet, mock_thread = create_mock_stream()
-        time.sleep(0.5)  # Give stream time to register
-        args.stream = "MockEMG_EMG"  # Auto-connect to mock stream
+        print("Starting mock EMG + IMU streams...")
+        mock_threads = create_mock_streams()
+        time.sleep(0.5)
+        args.stream = "MockMyo"
     
     app = QApplication(sys.argv)
     
     config = VisualizerConfig(dark_mode=args.dark)
     window = EMGVisualizer(config)
+    
+    if args.output:
+        window.output_dir = args.output
+        window.dir_label.setText(args.output)
+    
     window.show()
     
-    # Auto-connect if stream specified
+    # Auto-select streams if specified
     if args.stream:
-        # Refresh to find the stream first
         window.refresh_streams()
-        # Find and select the stream
-        for i in range(window.stream_combo.count()):
-            if args.stream in window.stream_combo.itemText(i):
-                window.stream_combo.setCurrentIndex(i)
-                break
-        window.connect_stream()
+        for i in range(window.stream_list.count()):
+            item = window.stream_list.item(i)
+            if args.stream in item.text():
+                item.setSelected(True)
+        if window.stream_list.selectedItems():
+            window.connect_streams()
     
     result = app.exec()
     
-    # Cleanup mock stream
-    if mock_thread:
-        mock_thread.do_run = False
-        mock_thread.join(timeout=1.0)
+    # Cleanup mock streams
+    for thread in mock_threads:
+        thread.do_run = False
+        thread.join(timeout=1.0)
     
     return result
 
 
-def create_mock_stream():
-    """Create an internal mock EMG stream for testing."""
+def create_mock_streams():
+    """Create mock EMG and IMU streams for testing."""
     import threading
     
-    # Create stream info
-    info = pylsl.StreamInfo(
-        name="MockEMG_EMG",
+    threads = []
+    
+    # EMG stream
+    emg_info = pylsl.StreamInfo(
+        name="MockMyo_EMG",
         type="EMG",
         channel_count=8,
         nominal_srate=200,
         channel_format=pylsl.cf_float32,
-        source_id="MockEMG_internal"
+        source_id="MockMyo_EMG"
     )
+    emg_outlet = pylsl.StreamOutlet(emg_info)
     
-    outlet = pylsl.StreamOutlet(info)
-    print(f"Created mock stream: MockEMG_EMG (8ch, 200Hz)")
-    
-    def generate_data(outlet):
-        """Generate synthetic EMG data."""
+    def generate_emg():
         t = 0
         thread = threading.current_thread()
         while getattr(thread, 'do_run', True):
-            # Generate 8 channels of synthetic EMG
             sample = []
             for ch in range(8):
-                # Base noise
-                val = np.random.normal(0, 5)
-                
-                # Add periodic bursts
-                if np.sin(2 * np.pi * 0.3 * t + ch * np.pi / 4) > 0.6:
-                    val += np.random.normal(50, 20)
-                
-                # Add 60Hz interference
-                val += 3 * np.sin(2 * np.pi * 60 * t)
-                sample.append(val)
-            
-            outlet.push_sample(sample)
+                val = np.random.normal(0, 10)
+                if np.sin(2 * np.pi * 0.3 * t + ch * np.pi / 4) > 0.5:
+                    val += np.random.normal(60, 25)
+                sample.append(np.clip(val, -127, 127))
+            emg_outlet.push_sample(sample)
             t += 1/200
             time.sleep(1/200)
     
-    thread = threading.Thread(target=generate_data, args=(outlet,), daemon=True)
-    thread.do_run = True
-    thread.start()
+    emg_thread = threading.Thread(target=generate_emg, daemon=True)
+    emg_thread.do_run = True
+    emg_thread.start()
+    threads.append(emg_thread)
     
-    return outlet, thread
+    # IMU stream
+    imu_info = pylsl.StreamInfo(
+        name="MockMyo_IMU",
+        type="IMU",
+        channel_count=10,
+        nominal_srate=50,
+        channel_format=pylsl.cf_float32,
+        source_id="MockMyo_IMU"
+    )
+    imu_outlet = pylsl.StreamOutlet(imu_info)
+    
+    def generate_imu():
+        t = 0
+        thread = threading.current_thread()
+        while getattr(thread, 'do_run', True):
+            angle = (t * 0.5) % (2 * np.pi)
+            sample = [
+                np.cos(angle/2), 0, np.sin(angle/2), 0,  # Quaternion
+                np.random.normal(0, 0.1), np.random.normal(0, 0.1), np.random.normal(-1, 0.1),  # Accel
+                np.random.normal(0, 5), np.random.normal(30*np.sin(t), 5), np.random.normal(0, 5)  # Gyro
+            ]
+            imu_outlet.push_sample(sample)
+            t += 1/50
+            time.sleep(1/50)
+    
+    imu_thread = threading.Thread(target=generate_imu, daemon=True)
+    imu_thread.do_run = True
+    imu_thread.start()
+    threads.append(imu_thread)
+    
+    print("Created: MockMyo_EMG (8ch, 200Hz), MockMyo_IMU (10ch, 50Hz)")
+    return threads
 
 
 if __name__ == "__main__":

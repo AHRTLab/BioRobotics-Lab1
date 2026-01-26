@@ -107,32 +107,74 @@ LSL is a protocol for streaming time-series data over a network. Key concepts:
 
 ### Myo Armband
 
-The Myo interface uses **pyomyo**, which communicates directly via Bluetooth - no SDK or MyoConnect needed!
+The Myo interface supports **two backends**:
+
+| Backend | Dongle Required | Best For |
+|---------|-----------------|----------|
+| **dl-myo** (recommended) | No - uses native Bluetooth | Multiple students, modern setup |
+| **pyomyo** (fallback) | Yes - blue USB dongle | Single device, proven reliability |
 
 **Installation:**
 ```bash
+# dl-myo (recommended - no dongle needed)
+pip install dl-myo
+
+# pyomyo (fallback - requires dongle)
 pip install git+https://github.com/PerlinWarp/pyomyo.git
 ```
 
-**IMPORTANT: Close MyoConnect before running!** pyomyo and MyoConnect cannot both access the Myo at the same time.
+**IMPORTANT: Close MyoConnect before running!**
 
-**Hardware Setup:**
-1. Charge the Myo armband
-2. Put on the armband (LED facing wrist)
-3. Close MyoConnect if it's running
-4. Run the streamer:
-   ```bash
-   python src/myo_interface.py
-   ```
+#### Basic Usage
 
-**EMG Modes:**
+```bash
+# Auto-detect backend and connect
+python src/myo_interface.py
+
+# Test without hardware
+python src/myo_interface.py --mock
+```
+
+#### EMG Modes
 - `--mode raw` (default): 200Hz, unfiltered (-128 to 127)
 - `--mode filtered`: 200Hz, filtered but not rectified
 - `--mode preprocessed`: 50Hz, bandpass filtered + rectified
 
-**Testing without hardware:**
+#### Multiple Myos / Multiple Students (dl-myo)
+
+With dl-myo, students can connect to specific Myos by MAC address:
+
 ```bash
-python src/myo_interface.py --mock
+# Scan for all Myos in range
+python src/myo_interface.py --scan
+
+# Connect to specific Myo by MAC address
+python src/myo_interface.py --mac D2:3B:85:94:32:8E
+```
+
+**Tip:** Label each Myo with its MAC address for easy identification!
+
+#### Using the Dongle (pyomyo fallback)
+
+If dl-myo doesn't work, you can fall back to pyomyo with the dongle:
+
+```bash
+# Force pyomyo backend
+python src/myo_interface.py --backend pyomyo
+
+# List available serial ports (to find dongle)
+python src/myo_interface.py --list-ports
+
+# Connect to specific dongle
+python src/myo_interface.py --backend pyomyo --tty COM5
+```
+
+#### Rollback to pyomyo Only
+
+If you need to use only pyomyo (the previous working version):
+```bash
+# A backup is available at:
+cp src/myo_interface_pyomyo.py src/myo_interface.py
 ```
 
 ### BioRadio 150
