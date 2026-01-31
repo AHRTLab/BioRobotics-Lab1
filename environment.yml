@@ -6,12 +6,10 @@
 #
 # Or with mamba (faster):
 #   mamba env create -f environment.yml
-
 name: biorobotics
 channels:
   - conda-forge
   - defaults
-
 dependencies:
   # Core Python
   - python=3.11
@@ -21,11 +19,11 @@ dependencies:
   - numpy>=1.24
   - scipy>=1.11
   - pandas>=2.0
+  - scikit-learn>=1.3
   
   # Visualization
   - matplotlib>=3.7
   - pyqtgraph>=0.13
- # - pyqt6>=6.5
   
   # Jupyter
   - jupyterlab>=4.0
@@ -34,7 +32,6 @@ dependencies:
   
   # LSL (Lab Streaming Layer)
   - liblsl>=1.16
-  # - pylsl>=1.16
   
   # Data formats
   - pyxdf>=1.16  # XDF file format for LSL recordings
@@ -65,7 +62,7 @@ dependencies:
     
     # Testing
     - pytest>=7.0
-
+    
+    # GUI and LSL (pip versions for better compatibility)
     - pyqt6
     - pylsl
-    - dl-myo
