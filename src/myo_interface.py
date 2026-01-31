@@ -751,14 +751,15 @@ def create_streamer(backend: str = "auto", **kwargs):
 # Scanning for Devices
 # ============================================================================
 
-async def scan_for_myos(timeout: float = 5.0):
+async def scan_for_myos(timeout: float = 5.0) -> list:
     """Scan for Myo devices using Bluetooth."""
     if not HAS_BLEAK:
         print("bleak required for scanning. Install with: pip install bleak")
         print("(Or install dl-myo which includes bleak: pip install dl-myo)")
         return []
     
-    print(f"Scanning for Myo devices ({timeout}s)...")
+    print(f"\nScanning for Myo devices ({timeout}s)...")
+    print("-" * 40)
     
     devices = await bleak.BleakScanner.discover(timeout=timeout)
     
@@ -767,17 +768,163 @@ async def scan_for_myos(timeout: float = 5.0):
         # Myo has a specific service UUID or name containing "Myo"
         name = d.name or ""
         if "Myo" in name:
-            myos.append({"name": name, "mac": d.address})
-            print(f"  Found: {name} ({d.address})")
+            myos.append({"name": name, "mac": d.address, "rssi": d.rssi})
+            rssi_str = f"{d.rssi} dBm" if d.rssi else "N/A"
+            print(f"  [{len(myos)}] {name}")
+            print(f"      MAC: {d.address}")
+            print(f"      Signal: {rssi_str}")
+    
+    print("-" * 40)
     
     if not myos:
-        print("  No Myo devices found")
-        print("  Make sure:")
-        print("    - Myo is charged and awake (move it)")
-        print("    - Bluetooth is enabled")
-        print("    - MyoConnect is closed")
+        print("No Myo devices found.")
+        print("\nTroubleshooting:")
+        print("  - Wake up the Myo by moving/shaking it")
+        print("  - Make sure Bluetooth is enabled")
+        print("  - Close MyoConnect if it's running")
+        print("  - Move closer to the computer")
+    else:
+        print(f"Found {len(myos)} Myo device(s)")
     
     return myos
+
+
+async def ping_myo(mac: str, timeout: float = 5.0) -> bool:
+    """
+    Ping a Myo device to verify it's reachable and identify it.
+    The Myo will vibrate when pinged successfully.
+    """
+    if not HAS_DLMYO:
+        print("dl-myo required for pinging. Install with: pip install dl-myo")
+        return False
+    
+    print(f"\nPinging Myo at {mac}...")
+    
+    try:
+        # Create a minimal client just to connect and vibrate
+        class PingClient(DLMyoClient):
+            async def on_emg_data(self, emg): pass
+            async def on_classifier_event(self, ce): pass
+            async def on_aggregated_data(self, ad): pass
+            async def on_emg_data_aggregated(self, emg): pass
+            async def on_fv_data(self, fvd): pass
+            async def on_imu_data(self, imu): pass
+            async def on_motion_event(self, me): pass
+        
+        client = await asyncio.wait_for(
+            PingClient.with_device(mac=mac),
+            timeout=timeout
+        )
+        
+        if client is None:
+            print(f"  ✗ Could not connect to {mac}")
+            return False
+        
+        # Vibrate to identify
+        try:
+            from myo.types import VibrationType
+            await client.vibrate(VibrationType.SHORT)
+            await asyncio.sleep(0.3)
+            await client.vibrate(VibrationType.SHORT)
+        except Exception as e:
+            print(f"  Warning: Could not vibrate: {e}")
+        
+        # Disconnect
+        try:
+            await client.disconnect()
+        except:
+            pass
+        
+        print(f"  ✓ Myo at {mac} responded! (It should have vibrated twice)")
+        return True
+        
+    except asyncio.TimeoutError:
+        print(f"  ✗ Timeout connecting to {mac}")
+        return False
+    except Exception as e:
+        print(f"  ✗ Error: {e}")
+        return False
+
+
+async def interactive_select() -> str:
+    """
+    Interactive mode: scan for Myos, let user select one, and optionally ping it.
+    Returns the selected MAC address or None.
+    """
+    print("=" * 50)
+    print("Myo Device Selection")
+    print("=" * 50)
+    
+    # Scan for devices
+    myos = await scan_for_myos(timeout=5.0)
+    
+    if not myos:
+        return None
+    
+    # If only one device, offer to use it directly
+    if len(myos) == 1:
+        mac = myos[0]['mac']
+        print(f"\nOnly one Myo found: {mac}")
+        response = input("Use this device? [Y/n]: ").strip().lower()
+        if response in ['', 'y', 'yes']:
+            # Offer to ping
+            ping = input("Ping to verify? (Myo will vibrate) [Y/n]: ").strip().lower()
+            if ping in ['', 'y', 'yes']:
+                await ping_myo(mac)
+            return mac
+        return None
+    
+    # Multiple devices - let user choose
+    while True:
+        print("\nOptions:")
+        print("  [1-{}] Select a Myo by number".format(len(myos)))
+        print("  [p #]  Ping a Myo (e.g., 'p 1' to ping device 1)")
+        print("  [r]    Rescan for devices")
+        print("  [q]    Quit")
+        
+        choice = input("\nYour choice: ").strip().lower()
+        
+        if choice == 'q':
+            return None
+        
+        if choice == 'r':
+            myos = await scan_for_myos(timeout=5.0)
+            if not myos:
+                return None
+            continue
+        
+        if choice.startswith('p '):
+            try:
+                idx = int(choice[2:]) - 1
+                if 0 <= idx < len(myos):
+                    await ping_myo(myos[idx]['mac'])
+                else:
+                    print("Invalid device number")
+            except ValueError:
+                print("Invalid input. Use 'p 1' to ping device 1")
+            continue
+        
+        # Try to parse as device number
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(myos):
+                mac = myos[idx]['mac']
+                print(f"\nSelected: {myos[idx]['name']} ({mac})")
+                
+                # Offer to ping
+                ping = input("Ping to verify? (Myo will vibrate) [Y/n]: ").strip().lower()
+                if ping in ['', 'y', 'yes']:
+                    success = await ping_myo(mac)
+                    if not success:
+                        retry = input("Ping failed. Use anyway? [y/N]: ").strip().lower()
+                        if retry not in ['y', 'yes']:
+                            continue
+                
+                return mac
+            else:
+                print("Invalid device number")
+        except ValueError:
+            print("Invalid input")
 
 
 def list_serial_ports():
@@ -824,76 +971,106 @@ Streams created:
   {name}_IMU  - 10 channels @ 50Hz (orientation + accel + gyro)
 
 Examples:
-  # Auto-detect backend and connect (streams both EMG + IMU)
-  python myo_interface.py
-  
-  # Stream EMG only (no IMU)
-  python myo_interface.py --no-imu
+  # RECOMMENDED: Interactive device selection
+  python myo_interface.py --select
   
   # Scan for Myo devices (shows MAC addresses)
   python myo_interface.py --scan
   
+  # Ping a specific Myo (it will vibrate twice)
+  python myo_interface.py --ping D2:3B:85:94:32:8E
+  
   # Connect to specific Myo by MAC address
   python myo_interface.py --mac D2:3B:85:94:32:8E
   
-  # Use pyomyo backend (dongle, EMG only)
-  python myo_interface.py --backend pyomyo
+  # Auto-detect (connects to first Myo found)
+  python myo_interface.py
   
-  # Use mock data for testing
+  # Use mock data for testing (no hardware needed)
   python myo_interface.py --mock
 
-Multiple Myos:
-  Use --scan to find all Myos in range, then --mac to connect to a specific one.
+Multiple Myos in classroom:
+  1. Run: python myo_interface.py --select
+  2. All nearby Myos will be listed with numbers
+  3. Ping your Myo to identify it (it vibrates)
+  4. Enter the number to select and start streaming
   
 IMPORTANT: Close MyoConnect before running!
         """
     )
     
+    # Device selection options
+    parser.add_argument("--select", action="store_true",
+                       help="Interactive mode: scan, ping, and select a Myo")
+    parser.add_argument("--scan", action="store_true",
+                       help="Scan for Myo devices and exit")
+    parser.add_argument("--ping",
+                       help="Ping a Myo by MAC address (it will vibrate)")
+    parser.add_argument("--mac",
+                       help="MAC address of Myo to connect to")
+    
+    # Backend options
     parser.add_argument("--backend", default="auto",
                        choices=["auto", "dl-myo", "pyomyo"],
                        help="Myo backend: dl-myo (native BT), pyomyo (dongle), auto")
     parser.add_argument("--mock", action="store_true",
                        help="Use mock data (no hardware)")
-    parser.add_argument("--scan", action="store_true",
-                       help="Scan for Myo devices and exit")
-    parser.add_argument("--mac",
-                       help="MAC address of Myo to connect to (dl-myo only)")
     parser.add_argument("--tty",
                        help="Serial port for dongle (pyomyo only)")
+    parser.add_argument("--list-ports", action="store_true",
+                       help="List serial ports (for pyomyo)")
+    
+    # Stream options
     parser.add_argument("--stream", default="Myo",
-                       help="LSL stream name prefix")
+                       help="LSL stream name prefix (default: Myo)")
     parser.add_argument("--mode", default="raw",
                        choices=["raw", "filtered", "preprocessed"],
-                       help="EMG mode")
+                       help="EMG mode (default: raw)")
     parser.add_argument("--no-imu", action="store_true",
                        help="Disable IMU streaming (EMG only)")
     parser.add_argument("--duration", type=int, default=0,
                        help="Duration in seconds (0 = run until Ctrl+C)")
-    parser.add_argument("--list-ports", action="store_true",
-                       help="List serial ports (for pyomyo)")
     
     args = parser.parse_args()
     
-    # Handle scan/list commands
+    # Handle scan command
     if args.scan:
         asyncio.run(scan_for_myos())
         return 0
     
+    # Handle ping command
+    if args.ping:
+        success = asyncio.run(ping_myo(args.ping))
+        return 0 if success else 1
+    
+    # Handle list-ports command
     if args.list_ports:
         list_serial_ports()
         return 0
     
+    # Handle interactive select mode
+    selected_mac = None
+    if args.select:
+        selected_mac = asyncio.run(interactive_select())
+        if selected_mac is None:
+            print("\nNo device selected. Exiting.")
+            return 0
+        print(f"\nStarting stream with MAC: {selected_mac}\n")
+    
     enable_imu = not args.no_imu
+    
+    # Determine MAC address to use
+    mac_to_use = selected_mac or args.mac
     
     # Create streamer
     if args.mock:
         streamer = MockMyoStreamer(stream_name=args.stream, enable_imu=enable_imu)
-    elif args.backend == "pyomyo" or (args.tty and not args.mac):
+    elif args.backend == "pyomyo" or (args.tty and not mac_to_use):
         streamer = create_streamer("pyomyo", stream_name=args.stream, 
                                    mode=args.mode, tty=args.tty)
-    elif args.mac:
+    elif mac_to_use:
         streamer = create_streamer("dl-myo", stream_name=args.stream,
-                                   mode=args.mode, mac=args.mac, enable_imu=enable_imu)
+                                   mode=args.mode, mac=mac_to_use, enable_imu=enable_imu)
     else:
         streamer = create_streamer(args.backend, stream_name=args.stream,
                                    mode=args.mode, enable_imu=enable_imu)
