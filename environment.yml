@@ -66,3 +66,4 @@ dependencies:
     # GUI and LSL (pip versions for better compatibility)
     - pyqt6
     - pylsl
+    - seaborn

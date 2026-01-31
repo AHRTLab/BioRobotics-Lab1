@@ -612,9 +612,12 @@ if HAS_GUI and HAS_LSL:
                 if len(timestamps) < 2:
                     continue
                 
-                # Time axis relative to now
-                t_now = timestamps[-1]
-                t_rel = timestamps - t_now
+                # Create UNIFORM time axis based on nominal sample rate
+                # This avoids BLE timing jitter causing jumpy displays
+                # Raw timestamps are still saved in CSV for accurate duration calculation
+                n_samples = len(timestamps)
+                sample_rate = reader.sample_rate or 200
+                t_rel = np.linspace(-n_samples / sample_rate, 0, n_samples)
                 
                 # Compute envelope if needed
                 envelope = None
@@ -790,6 +793,10 @@ if HAS_GUI and HAS_LSL:
                 filepath = os.path.join(self.output_dir, filename)
                 
                 # Save with metadata header
+                # Note: Raw timestamps are saved for accurate duration/effective sample rate calculation
+                # The timestamps have BLE jitter - use (samples-1)/(duration) for effective rate
+                effective_rate = (len(all_data) - 1) / (all_timestamps[-1] - all_timestamps[0]) if len(all_data) > 1 else 200
+                
                 with open(filepath, 'w') as f:
                     f.write(f"# participant_id: {self.metadata.participant_id}\n")
                     f.write(f"# gesture: {self.metadata.gesture}\n")
@@ -799,6 +806,8 @@ if HAS_GUI and HAS_LSL:
                     f.write(f"# timestamp: {timestamp}\n")
                     f.write(f"# samples: {len(all_data)}\n")
                     f.write(f"# duration_sec: {all_timestamps[-1] - all_timestamps[0]:.3f}\n")
+                    f.write(f"# nominal_sample_rate: 200\n")
+                    f.write(f"# effective_sample_rate: {effective_rate:.2f}\n")
                     f.write("#\n")
                     
                     # Header row
