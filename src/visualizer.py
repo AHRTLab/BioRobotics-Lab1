@@ -80,6 +80,42 @@ class RecordingMetadata:
     gesture: str = ""
     trial_number: int = 1
     notes: str = ""
+
+
+class RecordingBuffer:
+    """Thread-safe buffer that tracks what's been recorded to avoid duplication."""
+    
+    def __init__(self, n_channels: int):
+        self.n_channels = n_channels
+        self.data: List[np.ndarray] = []  # List of sample arrays
+        self.timestamps: List[float] = []  # List of timestamps
+        self._lock = threading.Lock()
+    
+    def add_samples(self, samples: np.ndarray, timestamps: np.ndarray):
+        """Add new samples. samples should be shape (n_samples, n_channels)."""
+        with self._lock:
+            for i, sample in enumerate(samples):
+                self.data.append(sample)
+                if i < len(timestamps):
+                    self.timestamps.append(timestamps[i])
+    
+    def get_all_data(self) -> tuple:
+        """Get all recorded data as numpy arrays."""
+        with self._lock:
+            if not self.data:
+                return np.array([]), np.array([])
+            data = np.array(self.data)
+            timestamps = np.array(self.timestamps)
+            return data, timestamps
+    
+    def clear(self):
+        """Clear the buffer."""
+        with self._lock:
+            self.data.clear()
+            self.timestamps.clear()
+    
+    def __len__(self):
+        return len(self.data)
     
 
 class SignalBuffer:
@@ -129,12 +165,32 @@ class LSLStreamReader(threading.Thread):
     def __init__(self, stream_name: str, buffer: SignalBuffer):
         super().__init__(daemon=True)
         self.stream_name = stream_name
-        self.buffer = buffer
+        self.buffer = buffer  # For visualization
         self.running = False
         self.inlet = None
         self.sample_count = 0
         self.sample_rate = 200
         self.error = None
+        
+        # Recording support
+        self.recording = False
+        self.recording_buffer: Optional[RecordingBuffer] = None
+    
+    def start_recording(self, n_channels: int):
+        """Start recording samples."""
+        self.recording_buffer = RecordingBuffer(n_channels)
+        self.recording = True
+        self._recording_samples = 0
+    
+    def stop_recording(self) -> tuple:
+        """Stop recording and return collected data."""
+        self.recording = False
+        recorded_count = getattr(self, '_recording_samples', 0)
+        if self.recording_buffer is not None:
+            data, timestamps = self.recording_buffer.get_all_data()
+            self.recording_buffer = None
+            return data, timestamps
+        return np.array([]), np.array([])
     
     def run(self):
         """Main thread loop."""
@@ -160,8 +216,17 @@ class LSLStreamReader(threading.Thread):
             while self.running:
                 samples, timestamps = self.inlet.pull_chunk(timeout=0.1)
                 if samples:
-                    self.buffer.add_samples(np.array(samples), np.array(timestamps))
+                    samples_arr = np.array(samples)
+                    timestamps_arr = np.array(timestamps)
+                    
+                    # Add to visualization buffer
+                    self.buffer.add_samples(samples_arr, timestamps_arr)
                     self.sample_count += len(samples)
+                    
+                    # Add to recording buffer if active
+                    if self.recording and self.recording_buffer is not None:
+                        self.recording_buffer.add_samples(samples_arr, timestamps_arr)
+                        self._recording_samples = getattr(self, '_recording_samples', 0) + len(samples)
         
         except Exception as e:
             self.error = str(e)
@@ -288,8 +353,7 @@ if HAS_GUI and HAS_LSL:
             # Stream state
             self.streams: Dict[str, dict] = {}  # name -> {reader, buffer, panel, info}
             self.recording = False
-            self.record_data: Dict[str, list] = {}  # stream_name -> [data chunks]
-            self.record_timestamps: Dict[str, list] = {}
+            self.recorded_data: Dict[str, tuple] = {}  # stream_name -> (data, timestamps)
             self.record_start_time = None
             
             # Metadata
@@ -634,11 +698,6 @@ if HAS_GUI and HAS_LSL:
                         if envelope is not None and i < len(panel.envelope_curves):
                             panel.envelope_curves[i].setData(t_rel, envelope[:, i])
                 
-                # Recording
-                if self.recording:
-                    self.record_data[name].append(data.copy())
-                    self.record_timestamps[name].append(timestamps.copy())
-                
                 # Rate calculation
                 current_count = reader.sample_count
                 rate_parts.append(f"{name.split('_')[-1]}: {current_count}")
@@ -689,12 +748,12 @@ if HAS_GUI and HAS_LSL:
                 QMessageBox.warning(self, "Error", "Please enter a Participant ID")
                 return
             
-            # Initialize recording buffers
-            self.record_data.clear()
-            self.record_timestamps.clear()
-            for name in self.streams:
-                self.record_data[name] = []
-                self.record_timestamps[name] = []
+            # Start recording on each stream reader
+            for name, stream in self.streams.items():
+                reader = stream['reader']
+                panel = stream['panel']
+                n_channels = panel.n_channels
+                reader.start_recording(n_channels)
             
             self.recording = True
             self.record_start_time = time.time()
@@ -718,6 +777,14 @@ if HAS_GUI and HAS_LSL:
             """Stop recording and save data."""
             self.recording = False
             duration = time.time() - self.record_start_time if self.record_start_time else 0
+            
+            # Collect recorded data from all stream readers
+            self.recorded_data = {}  # stream_name -> (data, timestamps)
+            for name, stream in self.streams.items():
+                reader = stream['reader']
+                data, timestamps = reader.stop_recording()
+                if len(data) > 0:
+                    self.recorded_data[name] = (data, timestamps)
             
             self.record_btn.setText("⏺ START RECORDING")
             self.record_btn.setStyleSheet("""
@@ -745,26 +812,16 @@ if HAS_GUI and HAS_LSL:
                 self.record_status.setText("No data to save")
         
         def save_recording(self) -> List[str]:
-            """Save recorded data to CSV files."""
-            saved_files = []
+            """Save recorded data to CSV files in hierarchical directory structure.
             
-            # Create output directory
-            os.makedirs(self.output_dir, exist_ok=True)
+            Structure: output_dir/participant_id/gesture/trial###_streamtype_timestamp.csv
+            """
+            saved_files = []
             
             # Timestamp for filename
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             
-            for stream_name, data_chunks in self.record_data.items():
-                if not data_chunks:
-                    continue
-                
-                # Concatenate data
-                try:
-                    all_data = np.vstack(data_chunks)
-                    all_timestamps = np.concatenate(self.record_timestamps[stream_name])
-                except:
-                    continue
-                
+            for stream_name, (all_data, all_timestamps) in self.recorded_data.items():
                 if len(all_data) == 0:
                     continue
                 
@@ -781,21 +838,33 @@ if HAS_GUI and HAS_LSL:
                     stream_type = 'data'
                     columns = [f'ch_{i+1}' for i in range(all_data.shape[1])]
                 
-                # Build filename
-                parts = [
-                    self.metadata.participant_id,
-                    self.metadata.gesture,
-                    f"trial{self.metadata.trial_number:03d}",
-                    stream_type,
-                    timestamp
-                ]
-                filename = "_".join(p for p in parts if p) + ".csv"
-                filepath = os.path.join(self.output_dir, filename)
+                # Build hierarchical directory path
+                # Structure: output_dir / participant_id / gesture /
+                participant_dir = self.metadata.participant_id if self.metadata.participant_id else "unknown"
+                gesture_dir = self.metadata.gesture if self.metadata.gesture else "unspecified"
                 
-                # Save with metadata header
-                # Note: Raw timestamps are saved for accurate duration/effective sample rate calculation
-                # The timestamps have BLE jitter - use (samples-1)/(duration) for effective rate
-                effective_rate = (len(all_data) - 1) / (all_timestamps[-1] - all_timestamps[0]) if len(all_data) > 1 else 200
+                # Create subdirectory path
+                subdir = os.path.join(self.output_dir, participant_dir, gesture_dir)
+                os.makedirs(subdir, exist_ok=True)
+                
+                # Build filename (simpler now that path contains context)
+                filename = f"trial{self.metadata.trial_number:03d}_{stream_type}_{timestamp}.csv"
+                filepath = os.path.join(subdir, filename)
+                
+                # Calculate duration and effective sample rate
+                if len(all_timestamps) > 1:
+                    duration = all_timestamps[-1] - all_timestamps[0]
+                    effective_rate = (len(all_data) - 1) / duration if duration > 0 else 200
+                else:
+                    duration = 0
+                    effective_rate = 200
+                
+                # Get nominal rate from stream reader
+                nominal_rate = 200
+                for stream in self.streams.values():
+                    if stream['reader'].stream_name == stream_name:
+                        nominal_rate = stream['reader'].sample_rate or 200
+                        break
                 
                 with open(filepath, 'w') as f:
                     f.write(f"# participant_id: {self.metadata.participant_id}\n")
@@ -805,8 +874,8 @@ if HAS_GUI and HAS_LSL:
                     f.write(f"# stream_type: {stream_type}\n")
                     f.write(f"# timestamp: {timestamp}\n")
                     f.write(f"# samples: {len(all_data)}\n")
-                    f.write(f"# duration_sec: {all_timestamps[-1] - all_timestamps[0]:.3f}\n")
-                    f.write(f"# nominal_sample_rate: 200\n")
+                    f.write(f"# duration_sec: {duration:.3f}\n")
+                    f.write(f"# nominal_sample_rate: {nominal_rate}\n")
                     f.write(f"# effective_sample_rate: {effective_rate:.2f}\n")
                     f.write("#\n")
                     
@@ -820,7 +889,7 @@ if HAS_GUI and HAS_LSL:
                         f.write(",".join(row) + "\n")
                 
                 saved_files.append(filepath)
-                print(f"Saved: {filepath}")
+                print(f"Saved: {filepath} ({len(all_data)} samples)")
             
             return saved_files
         
