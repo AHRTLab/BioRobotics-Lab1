@@ -314,6 +314,15 @@ In the visualizer:
 
 You should now see real-time EMG and IMU data in separate tabs.
 
+### Cannot Import PyQT6 Error
+
+On some systems, pip installing pyqt creates conflicts. So we need to remove the pip packages and install via condo.
+
+```bash
+python -m pip uninstall -y PyQt6 PyQt6-Qt6 PyQt6-sip
+conda install -c conda-forge pyqt=6 pyqtgraph qt-main
+```
+
 ### 3.4 Explore the EMG Signals
 
 With the visualizer running:
