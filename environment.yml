@@ -37,6 +37,9 @@ dependencies:
   - pyxdf>=1.16  # XDF file format for LSL recordings
   - h5py>=3.9    # HDF5 support
   
+  # Serial communication (BioRadio direct Python interface)
+  - pyserial>=3.5
+
   # Additional utilities
   - pyyaml>=6.0
   - tqdm>=4.65

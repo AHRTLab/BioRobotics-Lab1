@@ -7,11 +7,13 @@ This package provides tools for:
 - Real-time EMG visualization
 - EMG signal processing
 - Myo Armband interface
+- BioRadio direct Python interface (no .NET SDK required)
 - Proportional control demonstration
 
 Usage:
     from src.lsl_utils import discover_streams, LSLRecorder
     from src.emg_processing import bandpass_filter, envelope, compute_features
+    from src.bioradio import BioRadio, scan_for_bioradio
     from src.visualizer import EMGVisualizer
     from src.proportional_control import ProportionalControlDemo
 """
@@ -37,4 +39,12 @@ from .emg_processing import (
     compute_features,
     power_spectral_density,
     process_emg_pipeline,
+)
+
+from .bioradio import (
+    BioRadio,
+    scan_for_bioradio,
+    create_lsl_outlet,
+    DeviceConfig,
+    DataSample,
 )
