@@ -103,10 +103,17 @@ class DLMyoStreamer:
     Streams:
     - EMG: 8 channels at 200Hz (raw/filtered) or 50Hz (preprocessed)
     - IMU: 10 channels at 50Hz (orientation quaternion + accelerometer + gyroscope)
+    - Events (with sync=True): <stream>_Events markers, e.g. "arm_synced:right:toward_wrist"
+
+    EMG modes (same meaning as the pyomyo backend):
+    - raw:          unfiltered, unrectified, 200 Hz (Myo SEND_RAW). You do all the filtering.
+    - filtered:     the Myo's band-pass filtered, unrectified EMG, 200 Hz (SEND_EMG). What Myo Connect
+                    gave; cleaner (no mains hum).
+    - preprocessed: band-pass filtered AND rectified/smoothed envelope, 50 Hz (SEND_FILT).
     """
     
     def __init__(self, stream_name: str = "Myo", mac: str = None, mode: str = "raw",
-                 enable_imu: bool = True):
+                 enable_imu: bool = True, sync: bool = False):
         if not HAS_DLMYO:
             raise ImportError(
                 "dl-myo not available.\n"
@@ -119,6 +126,7 @@ class DLMyoStreamer:
         self.mac = mac
         self.mode_name = mode
         self.enable_imu = enable_imu
+        self.sync = sync
         self.sample_rate = 200 if mode in ["raw", "filtered"] else 50
         self.imu_sample_rate = 50  # IMU is always 50Hz
         
@@ -130,6 +138,9 @@ class DLMyoStreamer:
         self._thread = None
         self.emg_outlet = None
         self.imu_outlet = None
+        self.events_outlet = None
+        self.arm = None          # "right" / "left" once synced
+        self.x_direction = None  # "toward_wrist" / "toward_elbow" once synced
         
     def _setup_lsl_outlets(self):
         """Create LSL outlets for EMG and IMU data."""
@@ -155,6 +166,15 @@ class DLMyoStreamer:
         
         self.emg_outlet = pylsl.StreamOutlet(emg_info)
         print(f"Created LSL outlet: {self.stream_name}_EMG ({self.sample_rate}Hz, 8ch)")
+
+        # Events outlet (sync / arm / pose), only when the classifier is on
+        if self.sync:
+            ev_info = pylsl.StreamInfo(
+                name=f"{self.stream_name}_Events", type="Markers", channel_count=1,
+                nominal_srate=pylsl.IRREGULAR_RATE, channel_format=pylsl.cf_string,
+                source_id=f"{self.stream_name}_Events")
+            self.events_outlet = pylsl.StreamOutlet(ev_info)
+            print(f"Created LSL outlet: {self.stream_name}_Events (sync / arm / pose markers)")
         
         # IMU outlet (10 channels: quat(4) + accel(3) + gyro(3))
         if self.enable_imu:
@@ -292,17 +312,25 @@ class DLMyoStreamer:
                     if streamer.imu_sample_count == 0:
                         print(f"IMU data format: {type(imu)}, attrs: {dir(imu)}")
             
-            # Required abstract method stubs
             async def on_classifier_event(self, ce):
-                pass
+                """Sync / arm / pose events from the Myo's on-board classifier (--sync)."""
+                streamer._on_classifier_event(ce)
             
+            async def on_fv_data(self, fvd):
+                """'preprocessed' mode (SEND_FILT): rectified, smoothed EMG envelope, 8 channels."""
+                if streamer.mode_name != "preprocessed":
+                    return
+                try:
+                    streamer.emg_outlet.push_sample([float(v) for v in fvd.fv[:8]])
+                    streamer.sample_count += 1
+                except Exception:
+                    pass
+            
+            # Required abstract method stubs
             async def on_aggregated_data(self, ad):
                 pass
             
             async def on_emg_data_aggregated(self, emg):
-                pass
-            
-            async def on_fv_data(self, fvd):
                 pass
             
             async def on_motion_event(self, me):
@@ -338,13 +366,13 @@ class DLMyoStreamer:
         
         print("Connected to Myo!")
         
-        # Determine EMG mode
+        # Determine EMG mode (same meanings as the pyomyo backend; see the class docstring)
         if self.mode_name == "raw":
-            emg_mode = EMGMode.SEND_RAW
+            emg_mode = EMGMode.SEND_RAW    # unfiltered, 200 Hz        -> on_emg_data
         elif self.mode_name == "filtered":
-            emg_mode = EMGMode.SEND_FILT
+            emg_mode = EMGMode.SEND_EMG    # band-pass filtered, 200 Hz -> on_emg_data
         else:  # preprocessed
-            emg_mode = EMGMode.SEND_EMG  # rectified/preprocessed
+            emg_mode = EMGMode.SEND_FILT   # rectified envelope, 50 Hz  -> on_fv_data
         
         # Determine IMU mode
         imu_mode = IMUMode.SEND_DATA if self.enable_imu else IMUMode.NONE
@@ -352,7 +380,7 @@ class DLMyoStreamer:
         # Setup the client
         try:
             await self.client.setup(
-                classifier_mode=ClassifierMode.DISABLED,
+                classifier_mode=ClassifierMode.ENABLED if self.sync else ClassifierMode.DISABLED,
                 emg_mode=emg_mode,
                 imu_mode=imu_mode,
             )
@@ -373,6 +401,10 @@ class DLMyoStreamer:
         print(f"Streaming EMG at {self.sample_rate}Hz ({self.mode_name} mode)")
         if self.enable_imu:
             print(f"Streaming IMU at {self.imu_sample_rate}Hz (orientation + accel + gyro)")
+        if self.sync:
+            print("\nSYNC: wear the band snugly on the thickest part of your forearm and wait ~2 minutes")
+            print("      for it to warm up (better skin contact = less noise). Then do the sync gesture:")
+            print("      relax, then bend your wrist OUTWARD (wave out) and hold until the Myo vibrates.")
         
         # Keep running
         self._running = True
@@ -386,6 +418,29 @@ class DLMyoStreamer:
         except:
             pass
     
+    def _on_classifier_event(self, ce):
+        """Print a sync / arm / pose event and publish it on <stream>_Events."""
+        from myo.types import ClassifierEventType
+        t = ce.t
+        if t == ClassifierEventType.ARM_SYNCED:
+            self.arm = ce.arm.name.lower()
+            self.x_direction = ce.x_direction.name.lower()
+            text = f"arm_synced:{self.arm}:{self.x_direction}"
+            print(f"\n✓ Synced: {self.arm.upper()} arm, x-axis {self.x_direction.replace('_', ' ')}")
+        elif t == ClassifierEventType.ARM_UNSYNCED:
+            self.arm = self.x_direction = None
+            text = "arm_unsynced"
+            print("\n! Arm unsynced (band moved or taken off): do the sync gesture again")
+        elif t == ClassifierEventType.SYNC_FAILED:
+            text = f"sync_failed:{ce.sync_result.name.lower()}"
+            print(f"\n✗ Sync failed ({ce.sync_result.name.lower()}): relax and try the wave-out again, more gently")
+        elif t == ClassifierEventType.POSE:
+            text = f"pose:{ce.pose.name.lower()}"
+        else:
+            text = t.name.lower()
+        if self.events_outlet is not None:
+            self.events_outlet.push_sample([text])
+
     def _run_in_thread(self):
         """Run the async loop in a separate thread."""
         self._loop = asyncio.new_event_loop()
@@ -1031,7 +1086,11 @@ IMPORTANT: Close MyoConnect before running!
                        help="LSL stream name prefix (default: Myo)")
     parser.add_argument("--mode", default="raw",
                        choices=["raw", "filtered", "preprocessed"],
-                       help="EMG mode (default: raw)")
+                       help="EMG mode (default: raw). raw = unfiltered 200 Hz; filtered = the Myo's "
+                            "band-pass filtered 200 Hz; preprocessed = rectified envelope 50 Hz")
+    parser.add_argument("--sync", action="store_true",
+                       help="enable the Myo's sync: do the wave-out gesture to detect which arm and "
+                            "band orientation; events go to <stream>_Events (dl-myo backend)")
     parser.add_argument("--no-imu", action="store_true",
                        help="Disable IMU streaming (EMG only)")
     parser.add_argument("--duration", type=int, default=0,
@@ -1076,10 +1135,13 @@ IMPORTANT: Close MyoConnect before running!
                                    mode=args.mode, tty=args.tty)
     elif mac_to_use:
         streamer = create_streamer("dl-myo", stream_name=args.stream,
-                                   mode=args.mode, mac=mac_to_use, enable_imu=enable_imu)
+                                   mode=args.mode, mac=mac_to_use, enable_imu=enable_imu,
+                                   sync=args.sync)
     else:
         streamer = create_streamer(args.backend, stream_name=args.stream,
-                                   mode=args.mode, enable_imu=enable_imu)
+                                   mode=args.mode, enable_imu=enable_imu, sync=args.sync)
+    if args.sync and not isinstance(streamer, DLMyoStreamer):
+        print("Note: --sync needs the dl-myo backend; streaming without sync.")
     
     # Run
     try:

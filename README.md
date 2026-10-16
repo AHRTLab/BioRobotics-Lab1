@@ -230,6 +230,10 @@ python src/myo_interface.py --mac D2:3B:85:94:32:8E
 | `--scan` | List all nearby Myo devices |
 | `--ping MAC` | Make a specific Myo vibrate |
 | `--mac MAC` | Connect directly to a specific Myo |
+| `--mode raw` | (default) Unfiltered EMG, 200 Hz: you do all the filtering |
+| `--mode filtered` | The Myo's own band-pass filtered EMG, 200 Hz (what Myo Connect gave; no mains hum) |
+| `--mode preprocessed` | Filtered **and** rectified/smoothed EMG envelope, 50 Hz |
+| `--sync` | Turn on the Myo's sync: after ~2 min warm-up, do the wave-out gesture; it reports which arm and which way the band faces, and publishes `Myo_Events` markers |
 
 ### 2.6 Troubleshooting Device Discovery
 
