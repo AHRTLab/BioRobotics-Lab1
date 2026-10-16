@@ -41,11 +41,34 @@ VIBRATE_MEDIUM = 0x02
 VIBRATE_LONG = 0x03
 
 
+async def _discover(timeout: float):
+    """Scan, reporting real Bluetooth MACs on macOS (use_bdaddr) so addresses match myo_interface.py.
+    Ignored on Windows / Linux, which report MACs anyway."""
+    try:
+        return await BleakScanner.discover(timeout=timeout, cb=dict(use_bdaddr=True))
+    except Exception:
+        return await BleakScanner.discover(timeout=timeout)  # private macOS API unavailable
+
+
+async def _find_by_address(address: str, timeout: float = 10.0):
+    """The BLE device for a MAC (or, on macOS, the per-computer UUID a plain scan reports)."""
+    want = address.lower()
+    for use_bdaddr in (True, False):
+        try:
+            dev = await BleakScanner.find_device_by_filter(
+                lambda d, _adv: d.address.lower() == want, timeout=timeout, cb=dict(use_bdaddr=use_bdaddr))
+        except Exception:
+            dev = None
+        if dev is not None:
+            return dev
+    return None
+
+
 async def find_myo(timeout: float = 10.0) -> str:
     """Scan for Myo armband and return its address."""
     print(f"Scanning for Myo armband ({timeout}s timeout)...")
     
-    devices = await BleakScanner.discover(timeout=timeout)
+    devices = await _discover(timeout)
     
     for device in devices:
         name = device.name or ""
@@ -61,7 +84,11 @@ async def power_off_myo(address: str) -> bool:
     print(f"Connecting to Myo at {address}...")
     
     try:
-        async with BleakClient(address, timeout=15.0) as client:
+        device = await _find_by_address(address)
+        if device is None:
+            print(f"Could not find a Myo with address {address} (is it awake, and Myo Connect closed?)")
+            return False
+        async with BleakClient(device, timeout=15.0) as client:
             if not client.is_connected:
                 print("Failed to connect")
                 return False

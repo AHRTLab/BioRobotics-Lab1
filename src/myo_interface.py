@@ -761,7 +761,13 @@ async def scan_for_myos(timeout: float = 5.0) -> list:
     print(f"\nScanning for Myo devices ({timeout}s)...")
     print("-" * 40)
     
-    devices = await bleak.BleakScanner.discover(timeout=timeout)
+    # use_bdaddr: on macOS, report each device's real Bluetooth MAC instead of the per-computer UUID
+    # CoreBluetooth gives by default. dl-myo's connect-by-MAC (MyoClient.with_device(mac=...)) matches
+    # against real MACs, so a UUID from a plain scan never connects. Ignored on Windows / Linux.
+    try:
+        devices = await bleak.BleakScanner.discover(timeout=timeout, cb=dict(use_bdaddr=True))
+    except Exception:
+        devices = await bleak.BleakScanner.discover(timeout=timeout)  # private macOS API unavailable
     
     myos = []
     for d in devices:
