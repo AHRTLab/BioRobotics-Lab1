@@ -1014,6 +1014,31 @@ def list_serial_ports():
 # Command Line Interface
 # ============================================================================
 
+def tolerate_short_service_uuids() -> None:
+    """Silence a harmless scan error on macOS. Some nearby phones / beacons advertise 32-bit service
+    UUIDs; bleak 0.20 (the version dl-myo requires) only expands 16-bit ones, so it raises inside its
+    scan callback ("badly formed hexadecimal UUID string") and prints a traceback for every such
+    advertisement. The scan still works; this just expands 32-bit UUIDs and keeps odd ones as text."""
+    try:
+        from bleak.backends.corebluetooth import utils as cbu  # macOS only
+    except Exception:
+        return
+    if getattr(cbu.normalize_uuid_str, "_tolerant", False):
+        return
+    original = cbu.normalize_uuid_str
+
+    def normalize(uuid: str) -> str:
+        if len(uuid) == 8:  # Bluetooth base UUID, 32-bit form
+            uuid = f"{uuid}-0000-1000-8000-00805f9b34fb"
+        try:
+            return original(uuid)
+        except ValueError:
+            return uuid.lower()
+
+    normalize._tolerant = True  # type: ignore[attr-defined]
+    cbu.normalize_uuid_str = normalize
+
+
 def main():
     """Main entry point."""
     import argparse
@@ -1097,6 +1122,7 @@ IMPORTANT: Close MyoConnect before running!
                        help="Duration in seconds (0 = run until Ctrl+C)")
     
     args = parser.parse_args()
+    tolerate_short_service_uuids()
     
     # Handle scan command
     if args.scan:

@@ -183,6 +183,31 @@ async def power_off_myo(address: str) -> bool:
         return False
 
 
+def tolerate_short_service_uuids() -> None:
+    """Silence a harmless scan error on macOS. Some nearby phones / beacons advertise 32-bit service
+    UUIDs; bleak 0.20 (the version dl-myo requires) only expands 16-bit ones, so it raises inside its
+    scan callback ("badly formed hexadecimal UUID string") and prints a traceback for every such
+    advertisement. The scan still works; this just expands 32-bit UUIDs and keeps odd ones as text."""
+    try:
+        from bleak.backends.corebluetooth import utils as cbu  # macOS only
+    except Exception:
+        return
+    if getattr(cbu.normalize_uuid_str, "_tolerant", False):
+        return
+    original = cbu.normalize_uuid_str
+
+    def normalize(uuid: str) -> str:
+        if len(uuid) == 8:  # Bluetooth base UUID, 32-bit form
+            uuid = f"{uuid}-0000-1000-8000-00805f9b34fb"
+        try:
+            return original(uuid)
+        except ValueError:
+            return uuid.lower()
+
+    normalize._tolerant = True  # type: ignore[attr-defined]
+    cbu.normalize_uuid_str = normalize
+
+
 async def main(address: str = None, timeout: float = 10.0):
     """Main function."""
     if not address:
@@ -223,6 +248,7 @@ Note:
     )
     
     args = parser.parse_args()
+    tolerate_short_service_uuids()
     
     try:
         success = asyncio.run(main(args.address, args.timeout))
